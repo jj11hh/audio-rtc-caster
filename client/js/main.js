@@ -51,31 +51,6 @@ startButton.onclick = async () => {
 
         if (track.kind === 'audio') {
             console.log(`Initial remote track state: Enabled: ${track.enabled}, Muted: ${track.muted}`);
-            if (track.muted || !track.enabled) { // If muted OR not enabled, try to force unmute/enable
-                console.warn(`Track initially: Enabled: ${track.enabled}, Muted: ${track.muted}. Attempting to force unmute/enable.`);
-                try {
-                    console.log('Attempting to set track.enabled = false (to toggle)...');
-                    track.enabled = false;
-                    console.log(`Track state after setting enabled=false: Enabled: ${track.enabled}, Muted: ${track.muted}`);
-
-                    // Use a microtask (or short setTimeout) to allow the state change to propagate before setting back to true
-                    Promise.resolve().then(() => {
-                        console.log('Attempting to set track.enabled = true (to complete toggle)...');
-                        track.enabled = true;
-                        console.log(`Track state after setting enabled=true (toggled): Enabled: ${track.enabled}, Muted: ${track.muted}`);
-                        if (track.enabled && track.muted) {
-                             console.warn('Track is STILL enabled but muted after toggle. This is very persistent.');
-                        } else if (track.enabled && !track.muted) {
-                            console.info('Track is now enabled and unmuted after toggle. Audio should play.');
-                        }
-                    });
-
-                } catch (e) {
-                    console.error('Error toggling track.enabled:', e);
-                }
-            } else {
-                 console.info('Track received as enabled and not muted.');
-            }
         }
 
         if (event.streams && event.streams[0]) {
