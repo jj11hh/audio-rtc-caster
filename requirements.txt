@@ -1,0 +1,4 @@
+aiohttp
+aiortc
+pyaudiowpatch
+numpy

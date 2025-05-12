@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WebRTC Audio Playback</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+            color: #333;
+        }
+        #container {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        audio {
+            width: 100%;
+            margin-top: 15px;
+        }
+        button {
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #status {
+            margin-top: 15px;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>WebRTC 实时音频播放</h1>
+        <p>点击 "开始播放" 按钮从服务器接收实时音频。</p>
+        <audio id="audio" controls autoplay></audio>
+        <button id="startButton">开始播放</button>
+        <div id="status">状态：未连接</div>
+    </div>
+
+    <script src="js/main.js"></script>
+</body>
+</html>
