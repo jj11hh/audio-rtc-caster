@@ -2,10 +2,113 @@ import asyncio
 import logging
 import numpy as np
 import pyaudiowpatch as pyaudio # Assuming pyaudiowpatch is the intended library
+import threading # Added for RingBuffer
 from aiortc.contrib.media import MediaStreamTrack
 from aiortc.mediastreams import AudioFrame
 
 logger = logging.getLogger("audio_tracks") # Or pass logger instance if preferred
+logger_ringbuffer = logging.getLogger("audio_tracks.ringbuffer")
+
+
+class NumpyRingBuffer:
+    def __init__(self, capacity_items: int, item_size_bytes: int):
+        self.capacity_items = capacity_items
+        self.item_size_bytes = item_size_bytes
+        
+        self.buffer = np.zeros(capacity_items * item_size_bytes, dtype=np.uint8)
+        self.write_idx = 0  # Index for next item to write
+        self.read_idx = 0   # Index for next item to read
+        self.count = 0      # Number of items currently in buffer
+        
+        self._lock = threading.Lock() # For write access and shared state (count, write_idx, read_idx, _closed)
+        self._read_lock = asyncio.Lock() # Ensures only one async reader coroutine critical section at a time
+        self._data_available = asyncio.Event() # Signaled when new data is written, for async readers
+        self._closed = False
+
+    def write(self, data_bytes: bytes) -> bool:
+        """Writes a single item (data_bytes) to the buffer.
+           data_bytes must be of length self.item_size_bytes.
+           Returns True if write was successful, False if closed or data size mismatch.
+        """
+        if len(data_bytes) != self.item_size_bytes:
+            logger_ringbuffer.error(f"RingBuffer.write: Data size {len(data_bytes)} != expected item_size_bytes {self.item_size_bytes}")
+            return False
+
+        with self._lock:
+            if self._closed:
+                logger_ringbuffer.debug("RingBuffer.write: Attempted write to closed buffer.")
+                return False
+
+            # Overwrite oldest data if buffer is full
+            if self.count == self.capacity_items:
+                logger_ringbuffer.warning("RingBuffer.write: Buffer full, overwriting oldest data.")
+                # Advance read_idx because we are overwriting the oldest item
+                self.read_idx = (self.read_idx + 1) % self.capacity_items
+                self.count -= 1 # Effectively removing the oldest item being overwritten
+
+            buffer_start_offset = self.write_idx * self.item_size_bytes
+            buffer_end_offset = buffer_start_offset + self.item_size_bytes
+            self.buffer[buffer_start_offset:buffer_end_offset] = np.frombuffer(data_bytes, dtype=np.uint8)
+            
+            self.write_idx = (self.write_idx + 1) % self.capacity_items
+            self.count += 1
+            
+            self._data_available.set() # Signal any waiting readers
+        return True
+
+    async def read(self) -> bytes | None:
+        """Reads a single item from the buffer.
+           Waits if buffer is empty until data is available or buffer is closed.
+           Returns item_size_bytes of data, or None if closed and empty.
+        """
+        async with self._read_lock:
+            while True:
+                with self._lock: # Short critical section to check state and potentially retrieve data
+                    if self.count > 0:
+                        buffer_start_offset = self.read_idx * self.item_size_bytes
+                        buffer_end_offset = buffer_start_offset + self.item_size_bytes
+                        data_item_np = self.buffer[buffer_start_offset:buffer_end_offset]
+                        
+                        self.read_idx = (self.read_idx + 1) % self.capacity_items
+                        self.count -= 1
+                        
+                        if self.count == 0: # If buffer became empty after read
+                            self._data_available.clear() # No more data for now, subsequent reads will wait
+                        
+                        logger_ringbuffer.debug(f"RingBuffer.read: Read item. New count: {self.count}")
+                        return data_item_np.tobytes()
+
+                    if self._closed: # Buffer is empty and closed
+                        logger_ringbuffer.debug("RingBuffer.read: Buffer empty and closed.")
+                        self._data_available.set() # Ensure any other waiters also wake up and see it's closed
+                        return None
+                
+                # Buffer is empty but not closed, wait for data
+                logger_ringbuffer.debug("RingBuffer.read: Waiting for data_available event.")
+                await self._data_available.wait()
+                logger_ringbuffer.debug("RingBuffer.read: data_available event triggered.")
+
+    def close(self):
+        """Signals that no more data will be written to the buffer."""
+        with self._lock:
+            if not self._closed:
+                logger_ringbuffer.info("RingBuffer.close: Closing buffer.")
+                self._closed = True
+                self._data_available.set() # Wake up any waiting readers so they can see it's closed
+
+    def is_empty(self) -> bool:
+        with self._lock:
+            return self.count == 0
+
+    def qsize(self) -> int:
+        """Returns the number of items currently in the buffer."""
+        with self._lock:
+            return self.count
+            
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
 
 class BaseAudioTrack(MediaStreamTrack):
     kind = "audio"
@@ -62,17 +165,7 @@ class BaseAudioTrack(MediaStreamTrack):
         logger.debug(f"{self.__class__.__name__} stopping iteration.")
         raise StopAsyncIteration
 
-    async def _handle_no_data(self):
-        """
-        Handles cases where _generate_or_capture_frame_data returns no data,
-        allowing for a retry or graceful stop.
-        """
-        if self._should_stop_iteration():
-            self._handle_stop_iteration()
-        # Short pause before retrying to avoid busy-looping on transient errors
-        await asyncio.sleep(0.01)
-        return await self.recv()
-
+    # _handle_no_data method is removed as its logic is incorporated into recv
 
     async def _post_process_frame(self, frame):
         """
@@ -83,32 +176,40 @@ class BaseAudioTrack(MediaStreamTrack):
         pass
 
     async def recv(self):
-        if self._should_stop_iteration():
-            return self._handle_stop_iteration()
+        # Loop until a frame is available or stop is signaled
+        while True: # Loop will be broken by returning a frame or raising StopAsyncIteration
+            if self._should_stop_iteration():
+                # If the track is meant to stop (e.g. event set and conditions met by subclass override)
+                logger.debug(f"{self.__class__.__name__}.recv: Stop iteration condition met.")
+                self._handle_stop_iteration() # Raises StopAsyncIteration
 
-        try:
-            audio_data_reshaped, num_samples_this_frame = await self._generate_or_capture_frame_data()
-        except StopAsyncIteration: # Allow _generate_or_capture_frame_data to signal stop
-            raise
-        except Exception as e:
-            logger.error(f"{self.__class__.__name__} error in _generate_or_capture_frame_data: {e}")
-            self._stop_event.set() # Ensure stop on unexpected error
-            return self._handle_stop_iteration()
+            try:
+                audio_data_reshaped, num_samples_this_frame = await self._generate_or_capture_frame_data()
+            except StopAsyncIteration:
+                logger.debug(f"{self.__class__.__name__}.recv: StopAsyncIteration caught from _generate_or_capture_frame_data.")
+                raise # Propagate stop signal
+            except Exception as e:
+                logger.error(f"{self.__class__.__name__} error in _generate_or_capture_frame_data: {e}")
+                self._stop_event.set() # Ensure stop on unexpected error
+                self._handle_stop_iteration() # Raises StopAsyncIteration
 
+            if audio_data_reshaped is not None and num_samples_this_frame > 0:
+                # Data is available
+                if audio_data_reshaped.shape[1] == 0: # Should ideally not happen if num_samples_this_frame > 0
+                    logger.warning(f"{self.__class__.__name__}.recv: audio_data_reshaped has 0 samples despite num_samples_this_frame={num_samples_this_frame}. Retrying.")
+                    # Treat as no data / continue loop after delay
+                else:
+                    frame = self._create_audio_frame(audio_data_reshaped, num_samples_this_frame)
+                    await self._post_process_frame(frame)
+                    return frame # Frame is ready, exit loop and method
 
-        if audio_data_reshaped is None or num_samples_this_frame == 0:
-            # logger.debug(f"{self.__class__.__name__} received no data, handling...")
-            return await self._handle_no_data()
-
-        if audio_data_reshaped.shape[1] == 0 : # Double check if data is empty after processing
-            logger.warning(f"{self.__class__.__name__}.recv: audio_data_reshaped has 0 samples, attempting to get next frame.")
-            return await self._handle_no_data()
-
-        frame = self._create_audio_frame(audio_data_reshaped, num_samples_this_frame)
-        
-        await self._post_process_frame(frame) # Hook for subclasses
-
-        return frame
+            # No data available from _generate_or_capture_frame_data, or inconsistent data, but not stopping yet.
+            # Loop again after a short delay. This makes recv() block until a frame is ready.
+            if self._should_stop_iteration(): # Check again if stop was signaled during the no-data phase
+                logger.debug(f"{self.__class__.__name__}.recv: Stop iteration condition met after attempting to get data.")
+                self._handle_stop_iteration()
+            
+            await asyncio.sleep(0.01) # Wait a bit before retrying _generate_or_capture_frame_data
 
     async def stop(self):
         logger.info(f"Stopping {self.__class__.__name__}...")
@@ -119,14 +220,23 @@ class BaseAudioTrack(MediaStreamTrack):
 
 class AudioInputTrack(BaseAudioTrack):
     def __init__(self, p_instance, device_index, sample_rate=48000, channels=2, frames_per_buffer_ms=20):
-        super().__init__(sample_rate=sample_rate, channels=channels)
+        self.device_actual_channels = channels # Store actual device channels
+        # Force the track to be MONO for WebRTC and internal logic
+        super().__init__(sample_rate=sample_rate, channels=1) # self.channels is now 1
         self.p = p_instance
         self.device_index = device_index
         self.format = pyaudio.paInt16 # paInt16
         self.frames_per_buffer = int(self.sample_rate * frames_per_buffer_ms / 1000)
         self._frame_duration_seconds = frames_per_buffer_ms / 1000.0
 
-        self._queue = asyncio.Queue()
+        # RingBuffer setup
+        self.bytes_per_pyaudio_buffer = self.frames_per_buffer * self.device_actual_channels * 2 # 2 bytes for paInt16
+        BUFFER_CAPACITY_IN_CHUNKS = 100  # Store 100 PyAudio chunks (e.g., 100 * 20ms = 2 seconds)
+        self._ring_buffer = NumpyRingBuffer(
+            capacity_items=BUFFER_CAPACITY_IN_CHUNKS,
+            item_size_bytes=self.bytes_per_pyaudio_buffer
+        )
+        
         self._capture_task = None
         self.stream = None
         self._is_pyaudio_owner = False
@@ -145,7 +255,7 @@ class AudioInputTrack(BaseAudioTrack):
             device_info = self.p.get_device_info_by_index(self.device_index)
             logger.info(
                 f"AudioInputTrack: Initializing with device '{device_info['name']}' (Index {self.device_index}) "
-                f"Rate: {self.sample_rate}, Channels: {self.channels}, Format: paInt16, "
+                f"Rate: {self.sample_rate}, Device Actual Channels: {self.device_actual_channels}, Output Track Channels: {self.channels}, Format: paInt16, "
                 f"Frames per buffer: {self.frames_per_buffer}"
             )
         except Exception as e:
@@ -162,9 +272,9 @@ class AudioInputTrack(BaseAudioTrack):
             logger.warning("AudioInputTrack __init__: _stop_event IS SET. Capture task will not start.")
 
 
-    def _start_capture_thread_blocking(self):
+    def _start_capture_thread_blocking(self, main_loop):
         """This runs in a separate thread to read from PyAudio stream."""
-        logger.debug(f"AudioInputTrack: _start_capture_thread_blocking called for device {self.device_index}.")
+        logger.debug(f"AudioInputTrack: _start_capture_thread_blocking called for device {self.device_index} with main_loop: {main_loop}.")
         if self.device_index == -1:
             logger.error("Cannot start capture: No valid audio device.")
             self._stop_event.set()
@@ -173,40 +283,63 @@ class AudioInputTrack(BaseAudioTrack):
         try:
             self.stream = self.p.open(
                 format=self.format,
-                channels=self.channels,
+                channels=self.device_actual_channels, # Use actual device channels for capture
                 rate=self.sample_rate,
                 input=True,
                 input_device_index=self.device_index,
                 frames_per_buffer=self.frames_per_buffer,
                 stream_callback=None
             )
-            logger.info(f"PyAudio stream opened successfully for device {self.device_index} with sr={self.sample_rate}, ch={self.channels}, frames_per_buffer={self.frames_per_buffer}.")
+            logger.info(f"PyAudio stream opened successfully for device {self.device_index} with sr={self.sample_rate}, ch={self.device_actual_channels}, frames_per_buffer={self.frames_per_buffer}.")
         except Exception as e:
             logger.error(f"Failed to open PyAudio stream for device {self.device_index}: {e}")
             self.stream = None
             self._stop_event.set()
             return
 
-        loop = asyncio.get_event_loop() # Get loop from the main thread context where run_in_executor was called
-        logger.debug("AudioInputTrack: Starting PyAudio read loop.")
+        logger.debug(f"AudioInputTrack (capture_thread): Using provided main_loop: {main_loop}. Starting PyAudio read loop.")
         while not self._stop_event.is_set() and self.stream and self.stream.is_active():
             try:
-                # logger.debug(f"AudioInputTrack: Attempting to read {self.frames_per_buffer} frames from PyAudio stream.")
+                logger.debug(f"AudioInputTrack (capture_thread): Loop start. Stop event: {self._stop_event.is_set()}, Stream active: {self.stream.is_active() if self.stream else 'N/A'}")
+                logger.debug(f"AudioInputTrack (capture_thread): Attempting to read {self.frames_per_buffer} frames from PyAudio stream.")
                 raw_audio_bytes = self.stream.read(self.frames_per_buffer, exception_on_overflow=False)
-                logger.debug(f"AudioInputTrack: Read {len(raw_audio_bytes)} bytes from PyAudio stream. Putting into queue.")
-                asyncio.run_coroutine_threadsafe(self._queue.put(raw_audio_bytes), loop)
-            except IOError as e:
-                if hasattr(pyaudio, 'paInputOverflowed') and e.errno == pyaudio.paInputOverflowed: # type: ignore
-                    logger.warning("PyAudio input overflowed. Some audio data may have been lost.")
-                else:
-                    logger.error(f"PyAudio read error: {e}")
-                    self._stop_event.set()
+                bytes_read = len(raw_audio_bytes)
+                logger.debug(f"AudioInputTrack (capture_thread): Read {bytes_read} bytes from PyAudio stream.")
+
+                if bytes_read == 0:
+                    logger.warning("AudioInputTrack (capture_thread): Read 0 bytes from stream. Stream might be closing or no data available.")
+                    # Optionally, add a small sleep here if this happens often without error
+                    # await asyncio.sleep(0.001) # Requires loop.call_soon_threadsafe or similar if using asyncio.sleep
+                    # For a blocking thread, a simple time.sleep might be okay if issues persist
+                    # import time
+                    # time.sleep(0.001)
+                    continue # Try reading again
+
+                logger.debug(f"AudioInputTrack (capture_thread): Writing {bytes_read} bytes into ring_buffer.")
+                if not self._ring_buffer.write(raw_audio_bytes):
+                    logger.error("AudioInputTrack (capture_thread): Failed to write to ring_buffer (closed or size mismatch). Stopping.")
+                    self._stop_event.set() # Signal stop if write fails critically
                     break
+                logger.debug(f"AudioInputTrack (capture_thread): Successfully wrote data to ring_buffer. Buffer size: {self._ring_buffer.qsize()}")
+
+            except IOError as e:
+                # Check for specific PyAudio error codes if available and useful
+                # For example, paInputOverflowed is already handled.
+                # Add more specific checks if other IOError types are common.
+                if hasattr(pyaudio, 'paInputOverflowed') and e.errno == pyaudio.paInputOverflowed: # type: ignore
+                    logger.warning(f"AudioInputTrack (capture_thread): PyAudio input overflowed. {e}")
+                else:
+                    logger.error(f"AudioInputTrack (capture_thread): PyAudio IOError in read loop: {e} (errno: {e.errno if hasattr(e, 'errno') else 'N/A'})")
+                    self._stop_event.set()
+                    logger.info("AudioInputTrack (capture_thread): Set stop_event due to PyAudio IOError.")
+                    break # Exit loop
             except Exception as e:
-                logger.error(f"Exception in PyAudio capture loop: {e}")
+                logger.error(f"AudioInputTrack (capture_thread): Unexpected exception in PyAudio capture loop: {e}", exc_info=True)
                 self._stop_event.set()
-                break
+                logger.info("AudioInputTrack (capture_thread): Set stop_event due to unexpected exception.")
+                break # Exit loop
         
+        logger.debug(f"AudioInputTrack (capture_thread): Exited read loop. Stop event: {self._stop_event.is_set()}, Stream: {self.stream}")
         if self.stream:
             try:
                 if self.stream.is_active():
@@ -217,10 +350,10 @@ class AudioInputTrack(BaseAudioTrack):
                 logger.error(f"Error closing PyAudio stream: {e}")
         self.stream = None
         logger.debug("AudioInputTrack: Exited PyAudio read loop.")
-        # Signal queue that no more items will be added if we stopped
-        if self._stop_event.is_set():
-            logger.debug("AudioInputTrack: _stop_event is set, putting None sentinel into queue.")
-            asyncio.run_coroutine_threadsafe(self._queue.put(None), loop)
+        # Signal ring_buffer that no more items will be added
+        logger.debug("AudioInputTrack (capture_thread): Closing ring_buffer.")
+        self._ring_buffer.close()
+        logger.debug("AudioInputTrack (capture_thread): ring_buffer closed.")
 
 
     def _ensure_capture_task_running(self):
@@ -231,8 +364,9 @@ class AudioInputTrack(BaseAudioTrack):
                 self._stop_event.set()
                 return False # Indicate failure to start
 
-            loop = asyncio.get_event_loop()
-            self._capture_task = loop.run_in_executor(None, self._start_capture_thread_blocking)
+            current_loop = asyncio.get_event_loop() # This will be the main event loop
+            logger.debug(f"AudioInputTrack: Scheduling _start_capture_thread_blocking with current_loop: {current_loop}")
+            self._capture_task = current_loop.run_in_executor(None, self._start_capture_thread_blocking, current_loop) # Pass current_loop
             logger.info("AudioInputTrack capture task has been started.")
             return True # Indicate task started
         elif self._capture_task is not None and not self._stop_event.is_set():
@@ -247,67 +381,78 @@ class AudioInputTrack(BaseAudioTrack):
 
     async def _generate_or_capture_frame_data(self):
         logger.debug("AudioInputTrack: _generate_or_capture_frame_data called.")
-        if not self._ensure_capture_task_running() and self._queue.empty():
-            logger.debug("AudioInputTrack: Capture task not running and queue empty, stopping iteration.")
-            # If task couldn't start (e.g. stop_event set) and queue is empty
+        # If task isn't running (or couldn't start) and buffer is empty & closed, stop.
+        if not self._ensure_capture_task_running() and self._ring_buffer.is_empty() and self._ring_buffer.is_closed():
+            logger.debug("AudioInputTrack: Capture task not running, ring_buffer empty and closed. Stopping iteration.")
             raise StopAsyncIteration
+        elif not self._ensure_capture_task_running() and self._ring_buffer.is_empty():
+             logger.warning("AudioInputTrack: Capture task not running and ring_buffer empty, but buffer not marked closed. May lead to StopAsyncIteration on timeout if no data arrives.")
+
 
         try:
-            logger.debug(f"AudioInputTrack: Waiting for item from queue (qsize: {self._queue.qsize()}). Timeout: {self._frame_duration_seconds * 2}s")
-            raw_audio_bytes = await asyncio.wait_for(self._queue.get(), timeout=self._frame_duration_seconds * 2)
+            logger.debug(f"AudioInputTrack: Waiting for item from ring_buffer (buffer size: {self._ring_buffer.qsize()}). Timeout: {self._frame_duration_seconds * 2}s")
+            raw_audio_bytes = await asyncio.wait_for(self._ring_buffer.read(), timeout=self._frame_duration_seconds * 2)
             
-            if raw_audio_bytes is None: # Sentinel for end of stream from capture thread
-                logger.info("AudioInputTrack received None sentinel from queue, signaling stop.")
+            if raw_audio_bytes is None: # RingBuffer is closed and empty
+                logger.info("AudioInputTrack received None from ring_buffer.read(), signaling stop.")
                 raise StopAsyncIteration
-            logger.debug(f"AudioInputTrack: Got {len(raw_audio_bytes)} bytes from queue.")
+            logger.debug(f"AudioInputTrack: Got {len(raw_audio_bytes)} bytes from ring_buffer.")
             
         except asyncio.TimeoutError:
-            logger.debug(f"AudioInputTrack: Timeout waiting for item from queue. _stop_event: {self._stop_event.is_set()}, qsize: {self._queue.qsize()}")
-            if self._should_stop_iteration() and self._queue.empty(): # Check if we should stop
-                logger.debug("AudioInputTrack: Stopping iteration due to timeout and stop condition.")
+            logger.debug(f"AudioInputTrack: Timeout waiting for item from ring_buffer. _stop_event: {self._stop_event.is_set()}, buffer size: {self._ring_buffer.qsize()}, closed: {self._ring_buffer.is_closed()}")
+            # If stopping and buffer is truly empty (and potentially closed), then stop.
+            if self._should_stop_iteration() and self._ring_buffer.is_empty():
+                logger.debug("AudioInputTrack: Stopping iteration due to timeout and stop condition with empty buffer.")
                 raise StopAsyncIteration
             logger.debug("AudioInputTrack: Timeout, but not stopping. Returning (None,0) to retry.")
             return None, 0 # Indicate no data this attempt, recv will retry or stop
 
         samples_int16 = np.frombuffer(raw_audio_bytes, dtype=np.int16)
-        logger.debug(f"AudioInputTrack: Converted to {samples_int16.size} int16 samples from {len(raw_audio_bytes)} bytes.")
-        # logger.debug(f"AudioInputTrack.recv: Converted to {samples_int16.size} int16 samples.")
-        # if samples_int16.size > 0:
-        #     logger.debug(f"AudioInputTrack.recv: Sample values min: {np.min(samples_int16)}, max: {np.max(samples_int16)}, mean: {np.mean(samples_int16)}")
+        logger.debug(f"AudioInputTrack: Converted to {samples_int16.size} int16 samples from {len(raw_audio_bytes)} bytes (Device Actual Channels: {self.device_actual_channels}).")
 
         if samples_int16.size == 0:
             logger.warning("AudioInputTrack: samples_int16.size is 0 after frombuffer. Raw bytes length was %s.", len(raw_audio_bytes))
             return None, 0 # No data
 
-        num_samples_per_channel_total = samples_int16.size // self.channels
-        logger.debug(f"AudioInputTrack: num_samples_per_channel_total = {num_samples_per_channel_total}")
+        # Calculate samples per channel based on ACTUAL device channels used for capture
+        num_samples_per_channel_total = samples_int16.size // self.device_actual_channels
+        logger.debug(f"AudioInputTrack: num_samples_per_channel_total (based on {self.device_actual_channels} device channels) = {num_samples_per_channel_total}")
         
-        # Reshape based on channels
-        if self.channels == 1:
+        # Process data to be MONO (self.channels is 1 due to super().__init__ in __init__)
+        # The output track is configured as mono (self.channels == 1)
+        if self.device_actual_channels == 1:
+            # Input is mono, output is mono
             audio_data_reshaped = samples_int16.reshape(1, -1)
-        elif self.channels == 2:
-            if samples_int16.ndim == 1:
-                left_channel = samples_int16[0::2]
-                right_channel = samples_int16[1::2]
-                audio_data_reshaped = np.array([left_channel, right_channel], dtype=np.int16)
-            elif samples_int16.shape[1] == self.channels: # Already (samples, channels)
-                 audio_data_reshaped = samples_int16.T # Transpose to (channels, samples)
-            else:
-                logger.error(f"AudioInputTrack: Unexpected samples_int16 shape {samples_int16.shape} for {self.channels} channels.")
-                return None, 0 # Error in data shape
+        elif self.device_actual_channels == 2:
+            # Input is stereo, output is mono. Take left channel.
+            # samples_int16 is [L1, R1, L2, R2, ...]
+            left_channel_samples = samples_int16[0::2] # Take every 2nd element starting from 0 (left channel)
+            audio_data_reshaped = left_channel_samples.reshape(1, -1)
+            logger.debug(f"AudioInputTrack: Converted stereo input ({samples_int16.shape}) to mono ({audio_data_reshaped.shape}) by taking left channel.")
         else:
-            logger.error(f"AudioInputTrack: Unsupported number of channels: {self.channels}")
-            return None, 0 # Unsupported channels
+            # Input has more than 2 channels, or an unexpected configuration.
+            # For simplicity in this debugging step, just take the first channel's worth of data.
+            logger.warning(f"AudioInputTrack: Device has {self.device_actual_channels} channels. Taking first channel for mono output.")
+            first_channel_samples = samples_int16[0::self.device_actual_channels]
+            audio_data_reshaped = first_channel_samples.reshape(1, -1)
 
-        logger.debug(f"AudioInputTrack: Reshaped audio data to {audio_data_reshaped.shape}. Returning data.")
-        return audio_data_reshaped, num_samples_per_channel_total
+        logger.debug(f"AudioInputTrack: Reshaped audio data to {audio_data_reshaped.shape} for mono output. Returning data.")
+        return np.ascontiguousarray(audio_data_reshaped), num_samples_per_channel_total
 
 
     def _should_stop_iteration(self):
-        # Override to check queue status as well if stopping
-        if self._stop_event.is_set() and self._queue.empty():
-            return True
-        return self._stop_event.is_set()
+        # Override to check queue status as well if stopping.
+        # Stop iteration only if the stop event is set AND the queue is empty.
+        # This allows processing of remaining items in the ring_buffer after stop() is called.
+        if self._stop_event.is_set():
+            if self._ring_buffer.is_empty(): # And implicitly, if it's also closed, read() will return None.
+                logger.debug("AudioInputTrack._should_stop_iteration: True (stop event set AND ring_buffer empty).")
+                return True
+            else:
+                logger.debug(f"AudioInputTrack._should_stop_iteration: False (stop event set, but ring_buffer not empty, size: {self._ring_buffer.qsize()}).")
+                return False # Continue processing ring_buffer
+        logger.debug("AudioInputTrack._should_stop_iteration: False (stop event not set).")
+        return False # Stop event not set, continue normally
 
 
     async def stop(self):
@@ -317,17 +462,14 @@ class AudioInputTrack(BaseAudioTrack):
 
         if self._capture_task is not None:
             logger.info("AudioInputTrack: Attempting to stop and join audio capture task...")
-            # The capture thread checks _stop_event, and should put None in queue before exiting.
+            # The capture thread checks _stop_event, and should close the ring_buffer before exiting.
+            # _stop_event is set by super().stop() already.
             try:
-                # It's possible the task is already finishing if _stop_event was set and queue processed None
-                if not self._capture_task.done():
-                     # Ensure the queue is signaled if not already by the thread, especially if stop is forceful
-                    if self._queue and self._queue.empty(): # Check if queue is empty before potentially adding another None
-                        logger.debug("AudioInputTrack.stop(): Capture task not done, queue empty, putting None sentinel.")
-                        self._queue.put_nowait(None) # Help unblock queue.get() in capture task if it's stuck there
-                
+                # If the task is not done, it means the capture thread might still be running.
+                # It should see _stop_event and call _ring_buffer.close() upon exit.
+                # No explicit ring_buffer.close() here, as capture thread owns writing and closing.
                 logger.debug(f"AudioInputTrack.stop(): Waiting for capture task {self._capture_task} to complete.")
-                await asyncio.wait_for(self._capture_task, timeout=3.0) # Increased timeout slightly
+                await asyncio.wait_for(self._capture_task, timeout=3.0)
                 logger.info("AudioInputTrack: Audio capture task finished.")
             except asyncio.TimeoutError:
                 logger.warning("AudioInputTrack: Audio capture task did not finish in time during stop.")
@@ -339,16 +481,11 @@ class AudioInputTrack(BaseAudioTrack):
         else:
             logger.info("AudioInputTrack.stop(): No capture task to stop.")
         
-        # Ensure queue is drained or cleared to release any waiting recv
-        logger.debug(f"AudioInputTrack.stop(): Draining queue (current size: {self._queue.qsize() if self._queue else 'N/A'}).")
-        if self._queue:
-            while not self._queue.empty():
-                try:
-                    item = self._queue.get_nowait()
-                    logger.debug(f"AudioInputTrack.stop(): Drained item from queue (type: {type(item)}).")
-                except asyncio.QueueEmpty:
-                    break
-            logger.debug("AudioInputTrack.stop(): Queue drained.")
+        # Ring buffer doesn't need explicit draining here like the queue did.
+        # The capture thread is responsible for closing it.
+        # Consumers (recv via _generate_or_capture_frame_data) will get None from read()
+        # once the buffer is closed and empty.
+        logger.debug(f"AudioInputTrack.stop(): Ring buffer state: size={self._ring_buffer.qsize()}, closed={self._ring_buffer.is_closed()}")
         
         if self.p and self._is_pyaudio_owner:
             logger.info("AudioInputTrack: Terminating owned PyAudio instance.")

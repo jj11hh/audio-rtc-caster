@@ -5,18 +5,20 @@ import json
 import platform
 import argparse # Added for CLI arguments
 from aiohttp import web
-from aiortc import RTCIceCandidate, RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaRelay, MediaStreamTrack
-from aiortc.mediastreams import AudioFrame
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.contrib.media import MediaRelay
 # import pyaudio
 import pyaudiowpatch as pyaudio
-import numpy as np
-import wave # For debugging audio capture if needed
-import math # For sine wave generation
 from audio_tracks import AudioInputTrack, SineWaveTrack # Import new classes
 
 # 配置日志
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.DEBUG,
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger("pc")
 
 ROOT = os.path.dirname(__file__)
