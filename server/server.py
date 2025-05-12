@@ -13,7 +13,7 @@ from audio_tracks import AudioInputTrack, SineWaveTrack # Import new classes
 
 # 配置日志
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     handlers=[
         logging.FileHandler("app.log"),
         logging.StreamHandler()

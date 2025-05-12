@@ -41,7 +41,7 @@ class NumpyRingBuffer:
 
             # Overwrite oldest data if buffer is full
             if self.count == self.capacity_items:
-                logger_ringbuffer.warning("RingBuffer.write: Buffer full, overwriting oldest data.")
+                # logger_ringbuffer.warning("RingBuffer.write: Buffer full, overwriting oldest data.")
                 # Advance read_idx because we are overwriting the oldest item
                 self.read_idx = (self.read_idx + 1) % self.capacity_items
                 self.count -= 1 # Effectively removing the oldest item being overwritten
@@ -221,8 +221,7 @@ class BaseAudioTrack(MediaStreamTrack):
 class AudioInputTrack(BaseAudioTrack):
     def __init__(self, p_instance, device_index, sample_rate=48000, channels=2, frames_per_buffer_ms=20):
         self.device_actual_channels = channels # Store actual device channels
-        # Force the track to be MONO for WebRTC and internal logic
-        super().__init__(sample_rate=sample_rate, channels=1) # self.channels is now 1
+        super().__init__(sample_rate=sample_rate, channels=channels)
         self.p = p_instance
         self.device_index = device_index
         self.format = pyaudio.paInt16 # paInt16
@@ -390,25 +389,18 @@ class AudioInputTrack(BaseAudioTrack):
 
 
         try:
-            logger.debug(f"AudioInputTrack: Waiting for item from ring_buffer (buffer size: {self._ring_buffer.qsize()}). Timeout: {self._frame_duration_seconds * 2}s")
             raw_audio_bytes = await asyncio.wait_for(self._ring_buffer.read(), timeout=self._frame_duration_seconds * 2)
-            
             if raw_audio_bytes is None: # RingBuffer is closed and empty
                 logger.info("AudioInputTrack received None from ring_buffer.read(), signaling stop.")
                 raise StopAsyncIteration
-            logger.debug(f"AudioInputTrack: Got {len(raw_audio_bytes)} bytes from ring_buffer.")
             
         except asyncio.TimeoutError:
-            logger.debug(f"AudioInputTrack: Timeout waiting for item from ring_buffer. _stop_event: {self._stop_event.is_set()}, buffer size: {self._ring_buffer.qsize()}, closed: {self._ring_buffer.is_closed()}")
             # If stopping and buffer is truly empty (and potentially closed), then stop.
             if self._should_stop_iteration() and self._ring_buffer.is_empty():
-                logger.debug("AudioInputTrack: Stopping iteration due to timeout and stop condition with empty buffer.")
                 raise StopAsyncIteration
-            logger.debug("AudioInputTrack: Timeout, but not stopping. Returning (None,0) to retry.")
             return None, 0 # Indicate no data this attempt, recv will retry or stop
 
         samples_int16 = np.frombuffer(raw_audio_bytes, dtype=np.int16)
-        logger.debug(f"AudioInputTrack: Converted to {samples_int16.size} int16 samples from {len(raw_audio_bytes)} bytes (Device Actual Channels: {self.device_actual_channels}).")
 
         if samples_int16.size == 0:
             logger.warning("AudioInputTrack: samples_int16.size is 0 after frombuffer. Raw bytes length was %s.", len(raw_audio_bytes))
@@ -416,27 +408,8 @@ class AudioInputTrack(BaseAudioTrack):
 
         # Calculate samples per channel based on ACTUAL device channels used for capture
         num_samples_per_channel_total = samples_int16.size // self.device_actual_channels
-        logger.debug(f"AudioInputTrack: num_samples_per_channel_total (based on {self.device_actual_channels} device channels) = {num_samples_per_channel_total}")
-        
-        # Process data to be MONO (self.channels is 1 due to super().__init__ in __init__)
-        # The output track is configured as mono (self.channels == 1)
-        if self.device_actual_channels == 1:
-            # Input is mono, output is mono
-            audio_data_reshaped = samples_int16.reshape(1, -1)
-        elif self.device_actual_channels == 2:
-            # Input is stereo, output is mono. Take left channel.
-            # samples_int16 is [L1, R1, L2, R2, ...]
-            left_channel_samples = samples_int16[0::2] # Take every 2nd element starting from 0 (left channel)
-            audio_data_reshaped = left_channel_samples.reshape(1, -1)
-            logger.debug(f"AudioInputTrack: Converted stereo input ({samples_int16.shape}) to mono ({audio_data_reshaped.shape}) by taking left channel.")
-        else:
-            # Input has more than 2 channels, or an unexpected configuration.
-            # For simplicity in this debugging step, just take the first channel's worth of data.
-            logger.warning(f"AudioInputTrack: Device has {self.device_actual_channels} channels. Taking first channel for mono output.")
-            first_channel_samples = samples_int16[0::self.device_actual_channels]
-            audio_data_reshaped = first_channel_samples.reshape(1, -1)
+        audio_data_reshaped = samples_int16.reshape(1, -1)
 
-        logger.debug(f"AudioInputTrack: Reshaped audio data to {audio_data_reshaped.shape} for mono output. Returning data.")
         return np.ascontiguousarray(audio_data_reshaped), num_samples_per_channel_total
 
 
