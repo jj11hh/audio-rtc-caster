@@ -75,18 +75,14 @@ class NumpyRingBuffer:
                         if self.count == 0: # If buffer became empty after read
                             self._data_available.clear() # No more data for now, subsequent reads will wait
                         
-                        logger_ringbuffer.debug(f"RingBuffer.read: Read item. New count: {self.count}")
                         return data_item_np.tobytes()
 
                     if self._closed: # Buffer is empty and closed
-                        logger_ringbuffer.debug("RingBuffer.read: Buffer empty and closed.")
                         self._data_available.set() # Ensure any other waiters also wake up and see it's closed
                         return None
                 
                 # Buffer is empty but not closed, wait for data
-                logger_ringbuffer.debug("RingBuffer.read: Waiting for data_available event.")
                 await self._data_available.wait()
-                logger_ringbuffer.debug("RingBuffer.read: data_available event triggered.")
 
     def close(self):
         """Signals that no more data will be written to the buffer."""
