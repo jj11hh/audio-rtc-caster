@@ -207,9 +207,9 @@ class BaseAudioTrack(MediaStreamTrack):
             
             await asyncio.sleep(0.01) # Wait a bit before retrying _generate_or_capture_frame_data
 
-    async def stop(self):
+    def stop(self):
         logger.info(f"Stopping {self.__class__.__name__}...")
-        self._stop_event.set()
+        self._stop_event.set() # This is a synchronous operation
         # Subclasses should override to join tasks or release resources if needed,
         # then call super().stop() or manage _stop_event directly.
 
@@ -424,43 +424,69 @@ class AudioInputTrack(BaseAudioTrack):
         return False # Stop event not set, continue normally
 
 
-    async def stop(self):
+    def stop(self):
         logger.info(f"AudioInputTrack.stop() called. Current _stop_event: {self._stop_event.is_set()}")
-        await super().stop() # Sets _stop_event
-        logger.info(f"AudioInputTrack.stop(): super().stop() called, _stop_event is now: {self._stop_event.is_set()}")
+        
+        super().stop() # Calls the now synchronous BaseAudioTrack.stop()
+        logger.info(f"AudioInputTrack.stop(): super().stop() completed, _stop_event is now: {self._stop_event.is_set()}")
 
-        if self._capture_task is not None:
-            logger.info("AudioInputTrack: Attempting to stop and join audio capture task...")
-            # The capture thread checks _stop_event, and should close the ring_buffer before exiting.
-            # _stop_event is set by super().stop() already.
-            try:
-                # If the task is not done, it means the capture thread might still be running.
-                # It should see _stop_event and call _ring_buffer.close() upon exit.
-                # No explicit ring_buffer.close() here, as capture thread owns writing and closing.
-                logger.debug(f"AudioInputTrack.stop(): Waiting for capture task {self._capture_task} to complete.")
-                await asyncio.wait_for(self._capture_task, timeout=3.0)
-                logger.info("AudioInputTrack: Audio capture task finished.")
-            except asyncio.TimeoutError:
-                logger.warning("AudioInputTrack: Audio capture task did not finish in time during stop.")
-            except asyncio.CancelledError:
-                logger.warning("AudioInputTrack: Audio capture task was cancelled during stop.")
-            except Exception as e:
-                logger.error(f"AudioInputTrack: Exception while waiting for audio capture task to stop: {e}")
-            self._capture_task = None
+        capture_task_to_manage = self._capture_task
+        # Clear self._capture_task immediately to prevent re-scheduling or misuse of the same instance
+        # if stop() were called again before the async shutdown completes.
+        self._capture_task = None
+
+        if capture_task_to_manage is not None and not capture_task_to_manage.done():
+            logger.info(f"AudioInputTrack.stop(): Scheduling shutdown for active capture task: {capture_task_to_manage}")
+
+            async def _shutdown_async_resources():
+                try:
+                    logger.debug(f"AudioInputTrack (_shutdown_async_resources): Waiting for capture task {capture_task_to_manage} to complete.")
+                    await asyncio.wait_for(capture_task_to_manage, timeout=3.0)
+                    logger.info(f"AudioInputTrack (_shutdown_async_resources): Capture task {capture_task_to_manage} finished.")
+                except asyncio.TimeoutError:
+                    logger.warning(f"AudioInputTrack (_shutdown_async_resources): Capture task {capture_task_to_manage} timed out during stop.")
+                except asyncio.CancelledError:
+                    logger.warning(f"AudioInputTrack (_shutdown_async_resources): Capture task {capture_task_to_manage} was cancelled.")
+                except Exception as e:
+                    logger.error(f"AudioInputTrack (_shutdown_async_resources): Exception waiting for capture task {capture_task_to_manage}: {e}")
+                finally:
+                    # This block executes regardless of how the try block exited.
+                    if self.p and self._is_pyaudio_owner:
+                        logger.info("AudioInputTrack (_shutdown_async_resources): Terminating owned PyAudio instance.")
+                        try:
+                            self.p.terminate()
+                        except Exception as e_term:
+                            logger.error(f"AudioInputTrack (_shutdown_async_resources): Error terminating PyAudio: {e_term}")
+                        finally:
+                             # Always set p to None if we attempted termination, to prevent reuse/errors
+                            self.p = None
+                        logger.info("AudioInputTrack (_shutdown_async_resources): Owned PyAudio instance processed for termination.")
+            
+            asyncio.create_task(_shutdown_async_resources())
+            logger.info(f"AudioInputTrack.stop(): Asynchronous shutdown of capture task and PyAudio initiated.")
+
         else:
-            logger.info("AudioInputTrack.stop(): No capture task to stop.")
+            if capture_task_to_manage is not None: # Implies it was done
+                 logger.info(f"AudioInputTrack.stop(): Capture task {capture_task_to_manage} was already done.")
+            else: # capture_task_to_manage was None initially
+                 logger.info("AudioInputTrack.stop(): No active capture task to manage.")
+
+            # Directly terminate PyAudio if owned and not handled by an async shutdown task
+            if self.p and self._is_pyaudio_owner:
+                logger.info("AudioInputTrack.stop(): Terminating owned PyAudio instance (no active task or task already done).")
+                try:
+                    self.p.terminate()
+                except Exception as e_term:
+                    logger.error(f"AudioInputTrack.stop(): Error terminating PyAudio: {e_term}")
+                finally:
+                    self.p = None
+                logger.info("AudioInputTrack.stop(): Owned PyAudio instance processed for termination.")
+            elif not self._is_pyaudio_owner and self.p is not None:
+                logger.debug("AudioInputTrack.stop(): PyAudio instance exists but is not owned; not terminating.")
+            elif self.p is None:
+                 logger.debug("AudioInputTrack.stop(): PyAudio instance is None; no termination needed.")
         
-        # Ring buffer doesn't need explicit draining here like the queue did.
-        # The capture thread is responsible for closing it.
-        # Consumers (recv via _generate_or_capture_frame_data) will get None from read()
-        # once the buffer is closed and empty.
-        logger.debug(f"AudioInputTrack.stop(): Ring buffer state: size={self._ring_buffer.qsize()}, closed={self._ring_buffer.is_closed()}")
-        
-        if self.p and self._is_pyaudio_owner:
-            logger.info("AudioInputTrack: Terminating owned PyAudio instance.")
-            self.p.terminate()
-            self.p = None
-            logger.info("AudioInputTrack: Owned PyAudio instance terminated.")
+        logger.info(f"AudioInputTrack.stop(): Synchronous part of stop method finished.")
 
 
 class SineWaveTrack(BaseAudioTrack):
@@ -521,6 +547,6 @@ class SineWaveTrack(BaseAudioTrack):
         """
         pass # Removed: await asyncio.sleep(self._frame_duration_seconds)
 
-    async def stop(self):
-        await super().stop() # Sets _stop_event
+    def stop(self):
+        super().stop() # Sets _stop_event
         logger.info("SineWaveTrack stopped.")

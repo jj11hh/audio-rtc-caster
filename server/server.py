@@ -27,6 +27,9 @@ CLIENT_DIR = os.path.join(os.path.dirname(ROOT), "client") # ../client
 pcs = set()
 relay = MediaRelay()
 
+# Global variable to store command line arguments
+cli_args = None
+
 # --- Helper functions for device selection ---
 
 def find_pyaudiowpatch_loopback_device(p_instance):
@@ -157,7 +160,7 @@ async def offer(request):
     @pc.on("icecandidate")
     async def on_icecandidate(candidate):
         if candidate:
-            pass 
+            pass
 
     @pc.on("track")
     async def on_track(track):
@@ -169,72 +172,141 @@ async def offer(request):
         if pc.connectionState == "failed" or pc.connectionState == "closed":
             await pc.close()
             pcs.discard(pc)
-            # if audio_track and hasattr(audio_track, 'stop_if_no_consumers'): 
-            #     await audio_track.stop_if_no_consumers(pcs)
-
 
     if audio_track:
-        # sender = pc.addTrack(relay.subscribe(audio_track)) # Bypassing MediaRelay for testing
-        sender = pc.addTrack(audio_track) # Add track directly
-        logger.info(f"Audio track added directly to PC (bypassing MediaRelay). Sender: {sender}, Sender Track: {sender.track}")
+        sender = pc.addTrack(audio_track)
+        logger.info(f"Audio track added directly to PC. Sender: {sender}, Sender Track: {sender.track}")
         if sender.track:
             logger.info(f"  Directly added track kind: {sender.track.kind}, id: {sender.track.id}")
-        # logger.info("Audio track added to PC via MediaRelay.")
     else:
         logger.warning("No audio track available to add to PC.")
-
 
     await pc.setRemoteDescription(offer_sdp)
     answer_sdp = await pc.createAnswer()
 
-    # --- BEGIN SDP Modification for Stereo Opus ---
     logger.info("Original Answer SDP:\n%s", answer_sdp.sdp)
     sdp_lines = answer_sdp.sdp.strip().split('\r\n')
-    opus_payload_type = None
-    fmtp_line_index = -1
+
+    # --- BEGIN SDP Modification based on CLI arguments ---
+    codec_payload_type = None
     rtpmap_line_index = -1
+    fmtp_line_index = -1
+    media_line_index = -1 # For 'm=audio ...'
 
-    # Find Opus payload type and existing fmtp line index
+    # Find m=audio line, preferred codec's payload type, and its rtpmap/fmtp line indices
     for i, line in enumerate(sdp_lines):
-        if line.startswith("a=rtpmap:") and "opus/48000/2" in line:
+        if line.startswith("m=audio"):
+            media_line_index = i
+        
+        if line.startswith("a=rtpmap:"):
             try:
-                opus_payload_type = line.split(":")[1].split(" ")[0]
-                rtpmap_line_index = i
-                logger.info(f"Found Opus rtpmap payload type: {opus_payload_type} at line index {i}")
-            except IndexError:
-                logger.warning(f"Could not parse Opus payload type from line: {line}")
-                continue # Skip to next line if parsing fails
-        if opus_payload_type and line.startswith(f"a=fmtp:{opus_payload_type}"):
-            fmtp_line_index = i
-            logger.info(f"Found existing fmtp line for Opus payload type {opus_payload_type} at index {i}: {line}")
-            break # Found the relevant fmtp line, no need to search further
+                parts = line.split(" ", 1)
+                pt_part = parts[0].split(":")[1]
+                codec_part = parts[1]
+                codec_name_in_rtpmap = codec_part.split("/")[0].lower()
 
-    # Modify or add the fmtp line
-    if opus_payload_type:
-        stereo_params = "stereo=1;sprop-stereo=1"
-        if fmtp_line_index != -1:
-            # Append to existing fmtp line if stereo params are not already there
-            if stereo_params not in sdp_lines[fmtp_line_index]:
-                original_fmtp = sdp_lines[fmtp_line_index]
-                sdp_lines[fmtp_line_index] = f"{original_fmtp};{stereo_params}"
-                logger.info(f"Appended stereo params to existing fmtp line {fmtp_line_index}: {sdp_lines[fmtp_line_index]}")
+                if codec_name_in_rtpmap == cli_args.preferred_codec.lower():
+                    if codec_payload_type is None: # Take the first match
+                        codec_payload_type = pt_part
+                        rtpmap_line_index = i
+                        logger.info(f"Found rtpmap for preferred codec '{cli_args.preferred_codec}': PT={codec_payload_type}, line='{line}'")
+                        # Search for corresponding fmtp line
+                        for j, fmtp_candidate_line in enumerate(sdp_lines):
+                            if fmtp_candidate_line.startswith(f"a=fmtp:{codec_payload_type}"):
+                                fmtp_line_index = j
+                                logger.info(f"Found existing fmtp line for PT {codec_payload_type} at index {j}: {fmtp_candidate_line}")
+                                break
+                        break # Found preferred codec rtpmap, stop main loop
+            except Exception as e:
+                logger.warning(f"Could not parse rtpmap line: '{line}'. Error: {e}")
+
+    new_fmtp_params_list = []
+    if cli_args.preferred_codec.lower() == "opus":
+        new_fmtp_params_list.append("stereo=1") # Default stereo for Opus
+        new_fmtp_params_list.append("sprop-stereo=1")
+        if cli_args.opus_maxaveragebitrate:
+            new_fmtp_params_list.append(f"maxaveragebitrate={cli_args.opus_maxaveragebitrate}")
+        if cli_args.opus_maxplaybackrate:
+            new_fmtp_params_list.append(f"maxplaybackrate={cli_args.opus_maxplaybackrate}")
+        if cli_args.opus_cbr:
+            new_fmtp_params_list.append("cbr=1")
+        if cli_args.opus_useinbandfec:
+            new_fmtp_params_list.append("useinbandfec=1")
+        if cli_args.opus_usedtx:
+            new_fmtp_params_list.append("usedtx=1")
+
+    if codec_payload_type:
+        if fmtp_line_index != -1: # Existing fmtp line found
+            base_fmtp_line_parts = sdp_lines[fmtp_line_index].split(' ', 1)
+            existing_params_str = base_fmtp_line_parts[1] if len(base_fmtp_line_parts) > 1 else ""
+            
+            current_params_dict = {}
+            if existing_params_str:
+                for p_item in existing_params_str.split(';'):
+                    key_val = p_item.strip().split('=', 1)
+                    if len(key_val) == 2:
+                        current_params_dict[key_val[0]] = key_val[1]
+                    elif len(key_val) == 1 and key_val[0]:
+                        current_params_dict[key_val[0]] = True
+            
+            for p_item_str in new_fmtp_params_list:
+                key_val = p_item_str.split('=', 1)
+                if len(key_val) == 2:
+                    current_params_dict[key_val[0]] = key_val[1]
+                elif len(key_val) == 1 and key_val[0]:
+                     current_params_dict[key_val[0]] = True
+
+            final_fmtp_parts = []
+            for k, v in current_params_dict.items():
+                if isinstance(v, bool) and v is True: final_fmtp_parts.append(k)
+                else: final_fmtp_parts.append(f"{k}={v}")
+            
+            if final_fmtp_parts:
+                sdp_lines[fmtp_line_index] = f"a=fmtp:{codec_payload_type} {';'.join(final_fmtp_parts)}"
+                logger.info(f"Updated fmtp line {fmtp_line_index} for PT {codec_payload_type}: {sdp_lines[fmtp_line_index]}")
             else:
-                 logger.info(f"Stereo params already present in fmtp line {fmtp_line_index}. No change needed.")
-        elif rtpmap_line_index != -1:
-             # Insert new fmtp line after the rtpmap line
-            new_fmtp_line = f"a=fmtp:{opus_payload_type} {stereo_params}"
-            sdp_lines.insert(rtpmap_line_index + 1, new_fmtp_line)
-            logger.info(f"Inserted new fmtp line for Opus after rtpmap line {rtpmap_line_index}: {new_fmtp_line}")
-        else:
-            logger.warning("Found Opus rtpmap but could not find its index to insert fmtp line. SDP not modified for stereo.")
+                logger.info(f"No parameters to set for existing fmtp line {fmtp_line_index} for PT {codec_payload_type}. Line remains: {sdp_lines[fmtp_line_index]}")
 
-        modified_sdp = "\r\n".join(sdp_lines) + "\r\n" # Ensure trailing CRLF
-        answer_sdp = RTCSessionDescription(sdp=modified_sdp, type=answer_sdp.type)
-        logger.info("Modified Answer SDP with Stereo Opus params:\n%s", modified_sdp)
+        elif rtpmap_line_index != -1 and new_fmtp_params_list: # No existing fmtp, but rtpmap found and params to add
+            new_fmtp_line = f"a=fmtp:{codec_payload_type} {';'.join(new_fmtp_params_list)}"
+            insert_after_idx = rtpmap_line_index
+            for k_idx in range(rtpmap_line_index + 1, len(sdp_lines)):
+                line_k = sdp_lines[k_idx]
+                if line_k.startswith(f"a=rtcp-fb:{codec_payload_type}") or line_k.startswith(f"a=fmtp:{codec_payload_type}"):
+                    insert_after_idx = k_idx
+                elif line_k.startswith("a=rtpmap:") or line_k.startswith("m="): break
+            sdp_lines.insert(insert_after_idx + 1, new_fmtp_line)
+            logger.info(f"Inserted new fmtp line for PT {codec_payload_type} after line {insert_after_idx}: {new_fmtp_line}")
+        elif not new_fmtp_params_list:
+             logger.info(f"No new fmtp parameters specified via CLI for codec '{cli_args.preferred_codec}'.")
     else:
-        logger.warning("Opus codec (opus/48000/2) not found in the answer SDP. Cannot enforce stereo parameters.")
-    # --- END SDP Modification ---
+        logger.warning(f"Preferred codec '{cli_args.preferred_codec}' (rtpmap) not found. Cannot apply fmtp modifications.")
 
+    if cli_args.audio_bitrate and media_line_index != -1:
+        bitrate_kbps = cli_args.audio_bitrate // 1000
+        bandwidth_line = f"b=AS:{bitrate_kbps}"
+        b_line_exists_index = -1
+        next_m_line_index = len(sdp_lines)
+        for i in range(media_line_index + 1, len(sdp_lines)):
+            if sdp_lines[i].startswith("m="): next_m_line_index = i; break
+            if sdp_lines[i].startswith("b=AS:"): b_line_exists_index = i; break
+        
+        if b_line_exists_index != -1:
+            sdp_lines[b_line_exists_index] = bandwidth_line
+            logger.info(f"Updated bandwidth line at index {b_line_exists_index}: {bandwidth_line}")
+        else:
+            insert_b_at_index = media_line_index + 1
+            if insert_b_at_index < next_m_line_index and sdp_lines[insert_b_at_index].startswith("i="): insert_b_at_index +=1
+            if insert_b_at_index < next_m_line_index and sdp_lines[insert_b_at_index].startswith("c="): insert_b_at_index += 1
+            if insert_b_at_index >= next_m_line_index: insert_b_at_index = media_line_index + 1
+            sdp_lines.insert(insert_b_at_index, bandwidth_line)
+            logger.info(f"Inserted bandwidth line at index {insert_b_at_index}: {bandwidth_line}")
+
+    modified_sdp = "\r\n".join(sdp_lines) + "\r\n"
+    answer_sdp = RTCSessionDescription(sdp=modified_sdp, type=answer_sdp.type)
+    logger.info(f"Final Modified Answer SDP with CLI params:\n%s", modified_sdp)
+    # --- END SDP Modification ---
+    
     await pc.setLocalDescription(answer_sdp)
 
     # Log the final SDP being sent
@@ -351,7 +423,37 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sine-wave", action="store_true", help="Stream a 440Hz sine wave instead of system audio."
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--preferred-codec", type=str, default="opus", choices=["opus", "pcmu", "pcma", "g722"],
+        help="Preferred audio codec. Server will try to use this if offered by client."
+    )
+    parser.add_argument(
+        "--audio-bitrate", type=int, default=96000,
+        help="Target audio bitrate in bps (e.g., 32000). Sets 'b=AS:' line in SDP (converted to kbps)."
+    )
+    parser.add_argument(
+        "--opus-maxaveragebitrate", type=int, default=None,
+        help="Opus specific: Sets 'maxaveragebitrate' in bps (e.g., 20000)."
+    )
+    parser.add_argument(
+        "--opus-maxplaybackrate", type=int, default=48000, choices=[8000, 12000, 16000, 24000, 48000],
+        help="Opus specific: Sets 'maxplaybackrate' (e.g., 48000 for fullband)."
+    )
+    parser.add_argument(
+        "--opus-cbr", action="store_true",
+        help="Opus specific: Enable constant bitrate ('cbr=1'). May affect other bitrate settings."
+    )
+    parser.add_argument(
+        "--opus-useinbandfec", action="store_true", default=True,
+        help="Opus specific: Enable inband Forward Error Correction ('useinbandfec=1')."
+    )
+    parser.add_argument(
+        "--opus-usedtx", action="store_true", default=True,
+        help="Opus specific: Enable Discontinuous Transmission ('usedtx=1')."
+    )
+    
+    cli_args = parser.parse_args() # Assign to the global cli_args
+    args = cli_args # Keep 'args' for local use in main if preferred, or replace 'args' with 'cli_args' below
 
     p = None # Initialize PyAudio instance to None; will be created if not using sine wave
     # audio_track is global, declared at module level and assigned here
