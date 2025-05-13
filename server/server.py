@@ -186,9 +186,59 @@ async def offer(request):
 
     await pc.setRemoteDescription(offer_sdp)
     answer_sdp = await pc.createAnswer()
+
+    # --- BEGIN SDP Modification for Stereo Opus ---
+    logger.info("Original Answer SDP:\n%s", answer_sdp.sdp)
+    sdp_lines = answer_sdp.sdp.strip().split('\r\n')
+    opus_payload_type = None
+    fmtp_line_index = -1
+    rtpmap_line_index = -1
+
+    # Find Opus payload type and existing fmtp line index
+    for i, line in enumerate(sdp_lines):
+        if line.startswith("a=rtpmap:") and "opus/48000/2" in line:
+            try:
+                opus_payload_type = line.split(":")[1].split(" ")[0]
+                rtpmap_line_index = i
+                logger.info(f"Found Opus rtpmap payload type: {opus_payload_type} at line index {i}")
+            except IndexError:
+                logger.warning(f"Could not parse Opus payload type from line: {line}")
+                continue # Skip to next line if parsing fails
+        if opus_payload_type and line.startswith(f"a=fmtp:{opus_payload_type}"):
+            fmtp_line_index = i
+            logger.info(f"Found existing fmtp line for Opus payload type {opus_payload_type} at index {i}: {line}")
+            break # Found the relevant fmtp line, no need to search further
+
+    # Modify or add the fmtp line
+    if opus_payload_type:
+        stereo_params = "stereo=1;sprop-stereo=1"
+        if fmtp_line_index != -1:
+            # Append to existing fmtp line if stereo params are not already there
+            if stereo_params not in sdp_lines[fmtp_line_index]:
+                original_fmtp = sdp_lines[fmtp_line_index]
+                sdp_lines[fmtp_line_index] = f"{original_fmtp};{stereo_params}"
+                logger.info(f"Appended stereo params to existing fmtp line {fmtp_line_index}: {sdp_lines[fmtp_line_index]}")
+            else:
+                 logger.info(f"Stereo params already present in fmtp line {fmtp_line_index}. No change needed.")
+        elif rtpmap_line_index != -1:
+             # Insert new fmtp line after the rtpmap line
+            new_fmtp_line = f"a=fmtp:{opus_payload_type} {stereo_params}"
+            sdp_lines.insert(rtpmap_line_index + 1, new_fmtp_line)
+            logger.info(f"Inserted new fmtp line for Opus after rtpmap line {rtpmap_line_index}: {new_fmtp_line}")
+        else:
+            logger.warning("Found Opus rtpmap but could not find its index to insert fmtp line. SDP not modified for stereo.")
+
+        modified_sdp = "\r\n".join(sdp_lines) + "\r\n" # Ensure trailing CRLF
+        answer_sdp = RTCSessionDescription(sdp=modified_sdp, type=answer_sdp.type)
+        logger.info("Modified Answer SDP with Stereo Opus params:\n%s", modified_sdp)
+    else:
+        logger.warning("Opus codec (opus/48000/2) not found in the answer SDP. Cannot enforce stereo parameters.")
+    # --- END SDP Modification ---
+
     await pc.setLocalDescription(answer_sdp)
 
-    logger.info(f"Generated Answer SDP for client:\n{pc.localDescription.sdp}") # Log the generated SDP
+    # Log the final SDP being sent
+    logger.info(f"Final Answer SDP sent to client:\n{pc.localDescription.sdp}")
 
     return web.Response(
         content_type="application/json",
@@ -384,9 +434,11 @@ if __name__ == "__main__":
                 sample_rate=selected_device_info["rate"],
                 channels=selected_device_info["channels"]
             )
+            # Log the intended channel count for the created track
+            logger.info(f"AudioInputTrack created for device '{selected_device_info['name']}' (Index: {selected_device_info['index']}) with {selected_device_info['channels']} channel(s) at {selected_device_info['rate']} Hz.")
             if audio_track._stop_event.is_set(): # Check if AudioInputTrack itself failed init
                  logger.error("AudioInputTrack initialization failed. Audio streaming disabled.")
-                 audio_track = None 
+                 audio_track = None
         else:
             logger.error("No valid audio input device configured for AudioInputTrack. Audio streaming will be disabled.")
             audio_track = None

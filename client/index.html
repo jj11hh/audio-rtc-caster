@@ -2,35 +2,51 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WebRTC Audio Playback</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            margin: 20px;
+            margin: 0;
+            padding: 10px;
             background-color: #f4f4f4;
             color: #333;
+            line-height: 1.6;
         }
         #container {
             background-color: #fff;
-            padding: 20px;
+            padding: 15px;
             border-radius: 8px;
             box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            max-width: 600px;
+            margin: 20px auto;
         }
         h1 {
             color: #333;
+            font-size: 1.8em;
+            text-align: center;
+            margin-top: 0; /* Ensure no extra top margin */
+        }
+        p {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 0.95em;
         }
         audio {
             width: 100%;
             margin-top: 15px;
         }
         button {
-            padding: 10px 15px;
+            width: 100%;     /* Full width for mobile-first */
+            box-sizing: border-box; /* Include padding and border in the element's total width and height */
+            margin: 20px 0; /* Top/bottom margin. No horizontal auto margin as it's full width */
+            padding: 12px 15px;
             background-color: #007bff;
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 16px;
+            font-size: 1em;
         }
         button:hover {
             background-color: #0056b3;
@@ -38,16 +54,48 @@
         #status {
             margin-top: 15px;
             font-style: italic;
+            text-align: center;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+            word-break: break-all; /* Prevent long status messages from breaking layout */
+            font-size: 0.9em;
+        }
+
+        /* Responsive adjustments for smaller screens */
+        @media (max-width: 600px) {
+            body {
+                padding: 5px;
+            }
+            #container {
+                margin: 10px;
+                padding: 10px;
+            }
+            h1 {
+                font-size: 1.5em;
+            }
+            button {
+                font-size: 0.9em;
+                /* width: 100% is already the default from above */
+            }
+        }
+
+        /* Responsive adjustments for larger screens */
+        @media (min-width: 601px) {
+            button {
+                width: 300px; /* Or a more suitable fixed width */
+                margin: 20px auto; /* Center the button */
+            }
         }
     </style>
 </head>
 <body>
     <div id="container">
         <h1>WebRTC 实时音频播放</h1>
-        <p>点击 "开始播放" 按钮从服务器接收实时音频。</p>
-        <audio id="audio" controls autoplay></audio>
+        <p>此页面将自动连接服务器以接收实时音频。如果连接断开，它将尝试自动重新连接。</p>
+        <audio id="audio" controls autoplay playsinline></audio>
         <button id="startButton">开始播放</button>
-        <div id="status">状态：未连接</div>
+        <div id="status">状态：正在初始化...</div>
     </div>
 
     <script src="js/main.js"></script>
