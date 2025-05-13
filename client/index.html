@@ -87,6 +87,33 @@
                 margin: 20px auto; /* Center the button */
             }
         }
+
+        /* Loudness Meter Styles (SVG) */
+        #metersContainer {
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            margin-top: 20px;
+            background-color: #e0e0e0; /* Light grey background for the container */
+            padding: 10px;
+            border-radius: 4px;
+            height: 60px; /* Fixed height for the container */
+        }
+        .meter-svg {
+            width: 45%; /* Width of each SVG meter */
+            height: 40px; /* Height of SVG element */
+            border: 1px solid #ccc; /* Optional border for the SVG element itself */
+            background-color: #f0f0f0; /* Background for the area behind the bar */
+        }
+
+        .meter-svg rect.meter-bar {
+            fill: #007bff; /* Blue color for the loudness bar */
+            transition: width 0.1s linear; /* Smooth transition for width changes */
+        }
+
+        .meter-svg rect.meter-bg {
+            fill: #ddd; /* Background of the bar itself, if different from svg background */
+        }
     </style>
 </head>
 <body>
@@ -96,6 +123,17 @@
         <audio id="audio" controls autoplay playsinline></audio>
         <button id="startButton">开始播放</button>
         <div id="status">状态：正在初始化...</div>
+        <!-- Loudness Meters (SVG) -->
+        <div id="metersContainer">
+            <svg id="leftMeter" class="meter-svg">
+                <rect class="meter-bg" x="0" y="0" width="100%" height="100%"/>
+                <rect class="meter-bar" id="leftMeterBar" x="0" y="0" width="0%" height="100%"/>
+            </svg>
+            <svg id="rightMeter" class="meter-svg">
+                <rect class="meter-bg" x="0" y="0" width="100%" height="100%"/>
+                <rect class="meter-bar" id="rightMeterBar" x="0" y="0" width="0%" height="100%"/>
+            </svg>
+        </div>
     </div>
 
     <script src="js/main.js"></script>
