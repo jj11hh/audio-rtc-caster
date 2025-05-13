@@ -462,8 +462,19 @@ class AudioInputTrack(BaseAudioTrack):
                             self.p = None
                         logger.info("AudioInputTrack (_shutdown_async_resources): Owned PyAudio instance processed for termination.")
             
-            asyncio.create_task(_shutdown_async_resources())
-            logger.info(f"AudioInputTrack.stop(): Asynchronous shutdown of capture task and PyAudio initiated.")
+            if capture_task_to_manage._loop:
+                capture_task_to_manage._loop.create_task(_shutdown_async_resources())
+                logger.info(f"AudioInputTrack.stop(): Asynchronous shutdown of capture task and PyAudio initiated on loop {capture_task_to_manage._loop}.")
+            else:
+                # This case should ideally not happen if the future was properly created.
+                # Fallback or log an error.
+                logger.error("AudioInputTrack.stop(): capture_task_to_manage has no associated loop. Cannot schedule async shutdown.")
+                # As a fallback, try to run it on the current loop, though this might lead to the same error or other issues.
+                # Or, decide to handle PyAudio termination synchronously here if the loop is missing.
+                # For now, let's log and attempt with current loop, but this indicates a deeper issue if hit.
+                asyncio.create_task(_shutdown_async_resources())
+                logger.warning(f"AudioInputTrack.stop(): Asynchronous shutdown attempted on current loop as fallback.")
+
 
         else:
             if capture_task_to_manage is not None: # Implies it was done
