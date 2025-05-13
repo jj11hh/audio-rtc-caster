@@ -373,7 +373,7 @@ async def on_shutdown(app):
     pcs.clear()
     if audio_track and hasattr(audio_track, 'stop'):
         logger.info(f"Stopping global audio track ({type(audio_track).__name__}) on shutdown...")
-        await audio_track.stop() # Ensure stop is awaited
+        audio_track.stop()
         logger.info(f"Global audio track ({type(audio_track).__name__}) stopped on shutdown.")
 
 
