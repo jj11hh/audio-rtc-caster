@@ -137,7 +137,7 @@
     <div id="container">
         <h1>WebRTC 实时音频播放</h1>
         <p>此页面将自动连接服务器以接收实时音频。如果连接断开，它将尝试自动重新连接。</p>
-        <audio id="audio" controls autoplay playsinline></audio>
+        <audio id="audio" controls playsinline></audio>
         <button id="startButton">开始播放</button>
         <div style="text-align: center; margin: 10px 0;">
             <label for="lowLatencyToggle" style="cursor: pointer;">
@@ -150,6 +150,7 @@
         <div style="text-align: center; margin: 10px 0;">
             <button id="latencyTestButton">Start Latency Test</button>
             <div id="latencyResult" style="margin-top: 8px; font-weight: bold;">Latency: N/A</div>
+            <div id="jitterBufferDelayResult" style="margin-top: 8px; font-weight: bold;">Avg Jitter Buffer Delay: N/A</div>
         </div>
 
         <!-- Loudness Meters (SVG) -->

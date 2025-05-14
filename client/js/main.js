@@ -8,11 +8,14 @@ const rightMeterBar = document.getElementById('rightMeterBar');
 const lowLatencyToggle = document.getElementById('lowLatencyToggle');
 const latencyTestButton = document.getElementById('latencyTestButton');
 const latencyResultDiv = document.getElementById('latencyResult');
+const jitterBufferDelayResultDiv = document.getElementById('jitterBufferDelayResult');
 
 let pc;
 let localStream; // Might be used if track needs adding to a new stream
 let reconnectInterval = 5000; // 5 seconds
 let reconnectTimerId = null;
+let statsIntervalId = null; // For jitter buffer stats
+const STATS_INTERVAL_MS = 1000; // How often to fetch stats
 
 // Web Audio API variables
 let audioContext = null;
@@ -36,6 +39,15 @@ let lastTestInitiationTime = 0;
 const MIN_TIME_BETWEEN_TESTS_MS = 2000; // Cooldown period
 
 async function connect() {
+    // Attempt to initialize or resume AudioContext on user gesture (button click)
+    // This is crucial for Safari and other browsers with strict autoplay policies.
+    if (!await ensureAudioContextRunning()) {
+        console.warn("AudioContext could not be started/resumed on connect. Latency test and meters might not work.");
+        // Optionally, inform the user more directly or disable features that depend on AudioContext.
+        // For now, we'll let the rest of the connection proceed, but features might be limited.
+        if (latencyTestButton) latencyTestButton.disabled = true;
+    }
+
     if (reconnectTimerId) {
         clearTimeout(reconnectTimerId);
         reconnectTimerId = null;
@@ -59,6 +71,15 @@ async function connect() {
 
     const configuration = {}; // No STUN/TURN servers for local demo
 
+    // Fallback for Safari
+    const RTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    if (!RTCPeerConnection) {
+        console.error("RTCPeerConnection API is not supported by this browser.");
+        statusDiv.textContent = '状态：错误 - WebRTC 不受支持。';
+        startButton.disabled = false;
+        startButton.textContent = '开始播放';
+        return;
+    }
     pc = new RTCPeerConnection(configuration);
 
     pc.onicecandidate = event => {
@@ -80,6 +101,7 @@ async function connect() {
                     clearTimeout(reconnectTimerId);
                     reconnectTimerId = null;
                 }
+                startJitterBufferStats(); // Start collecting stats
                 break;
             case 'disconnected':
                 statusDiv.textContent = '状态：连接已断开。尝试重新连接...';
@@ -90,6 +112,7 @@ async function connect() {
                     console.log(`ICE disconnected. Attempting to reconnect in ${reconnectInterval / 1000}s...`);
                     reconnectTimerId = setTimeout(connect, reconnectInterval);
                 }
+                stopJitterBufferStats(); // Stop collecting stats
                 break;
             case 'failed':
                 statusDiv.textContent = '状态：连接失败。请检查服务器和网络。尝试重新连接...';
@@ -100,6 +123,7 @@ async function connect() {
                     console.log(`ICE failed. Attempting to reconnect in ${reconnectInterval / 1000}s...`);
                     reconnectTimerId = setTimeout(connect, reconnectInterval);
                 }
+                stopJitterBufferStats(); // Stop collecting stats
                 break;
             case 'closed':
                 statusDiv.textContent = '状态：连接已关闭。';
@@ -110,9 +134,77 @@ async function connect() {
                     clearTimeout(reconnectTimerId);
                     reconnectTimerId = null;
                 }
+                stopJitterBufferStats(); // Stop collecting stats
                 break;
         }
     };
+
+    async function getJitterBufferStats() {
+        if (!pc || pc.connectionState !== 'connected' && pc.connectionState !== 'completed') {
+            return;
+        }
+
+        const receivers = pc.getReceivers();
+        for (const receiver of receivers) {
+            if (receiver.track && receiver.track.kind === 'audio') {
+                try {
+                    const stats = await receiver.getStats();
+                    let totalJitterBufferDelay = 0;
+                    let totalJitterBufferEmittedCount = 0;
+                    let foundInboundRtp = false;
+
+                    stats.forEach(report => {
+                        if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+                            foundInboundRtp = true;
+                            totalJitterBufferDelay += report.jitterBufferDelay || 0;
+                            totalJitterBufferEmittedCount += report.jitterBufferEmittedCount || 0;
+                            // Log individual report for debugging if needed
+                            // console.log(`Inbound RTP Audio: JitterBufferDelay=${report.jitterBufferDelay}, EmittedCount=${report.jitterBufferEmittedCount}`);
+                        }
+                    });
+
+                    if (foundInboundRtp && jitterBufferDelayResultDiv) {
+                        if (totalJitterBufferEmittedCount > 0) {
+                            const averageDelayMs = (totalJitterBufferDelay / totalJitterBufferEmittedCount) * 1000;
+                            jitterBufferDelayResultDiv.textContent = `Avg Jitter Buffer Delay: ${averageDelayMs.toFixed(2)} ms`;
+                        } else {
+                            jitterBufferDelayResultDiv.textContent = 'Avg Jitter Buffer Delay: N/A (no emitted packets)';
+                        }
+                    } else if (jitterBufferDelayResultDiv) {
+                        // jitterBufferDelayResultDiv.textContent = 'Avg Jitter Buffer Delay: N/A (no inbound-rtp audio stats)';
+                    }
+                } catch (err) {
+                    console.error('Error getting receiver stats:', err);
+                    if (jitterBufferDelayResultDiv) {
+                        jitterBufferDelayResultDiv.textContent = 'Avg Jitter Buffer Delay: Error';
+                    }
+                }
+                break; // Assuming one audio receiver for simplicity
+            }
+        }
+    }
+
+    function startJitterBufferStats() {
+        stopJitterBufferStats(); // Clear any existing interval
+        if (jitterBufferDelayResultDiv) { // Ensure element exists
+            statsIntervalId = setInterval(getJitterBufferStats, STATS_INTERVAL_MS);
+            console.log('Started jitter buffer stats collection.');
+        } else {
+            console.warn('Jitter buffer delay result div not found. Stats not started.');
+        }
+    }
+
+    function stopJitterBufferStats() {
+        if (statsIntervalId) {
+            clearInterval(statsIntervalId);
+            statsIntervalId = null;
+            console.log('Stopped jitter buffer stats collection.');
+            if (jitterBufferDelayResultDiv) {
+                 // Optionally reset text when stopping
+                // jitterBufferDelayResultDiv.textContent = 'Avg Jitter Buffer Delay: N/A (stopped)';
+            }
+        }
+    }
 
     pc.ontrack = event => {
         console.log('Remote track received:', event.track);
@@ -168,51 +260,66 @@ async function connect() {
         // Try to play
         console.log('Attempting audioPlayer.play()...');
 
+        // Helper function to setup analysis and update UI once audio is actually playing
+        async function initiateAudioAnalysisAndUI() {
+            console.log("Initiating audio analysis and UI updates.");
+            if (await ensureAudioContextRunning()) {
+                const streamForAnalysis = (event.streams && event.streams[0]) || (localStream && localStream.getAudioTracks().length > 0 ? localStream : null);
+                if (streamForAnalysis) {
+                    setupAudioAnalysis(streamForAnalysis);
+                } else {
+                    console.warn("No valid stream found for audio analysis setup.");
+                }
+            } else {
+                console.warn("AudioContext could not be started/resumed. Audio analysis/meters will be disabled.");
+                if (latencyTestButton) latencyTestButton.disabled = true;
+            }
+
+            console.log(`Audio player state after play success: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
+            if (statusDiv) statusDiv.textContent = '状态：音频正在播放。';
+            if (startButton) {
+                startButton.textContent = '正在播放'; // Update button text
+                startButton.disabled = true;
+            }
+            if (latencyTestButton) {
+                if (audioContext && audioContext.state === 'running') { // Only enable if context is good
+                    latencyTestButton.disabled = false;
+                } else {
+                    latencyTestButton.disabled = true;
+                }
+            }
+        }
+
         const playAudio = async () => {
             try {
-                // For iOS Safari, ensure AudioContext is resumed by user gesture
-                // The 'connect' button click is our primary user gesture.
-                // If audioContext was created and is suspended, try to resume it.
+                // Ensure AudioContext is resumed by user gesture if needed
                 if (audioContext && audioContext.state === 'suspended') {
-                    console.log('AudioContext is suspended, attempting to resume...');
+                    console.log('AudioContext is suspended, attempting to resume before play()...');
                     await audioContext.resume();
                     console.log('AudioContext resumed, state:', audioContext.state);
                 }
 
                 await audioPlayer.play();
                 console.log('audioPlayer.play() promise resolved successfully.');
+                await initiateAudioAnalysisAndUI();
 
-                // Ensure AudioContext is running and setup analysis
-                if (await ensureAudioContextRunning()) {
-                    const streamForAnalysis = (event.streams && event.streams[0]) || (localStream && localStream.getAudioTracks().length > 0 ? localStream : null);
-                    if (streamForAnalysis) {
-                        setupAudioAnalysis(streamForAnalysis);
-                    } else {
-                        console.warn("No valid stream found for audio analysis setup.");
-                    }
-                } else {
-                    console.warn("AudioContext could not be started/resumed. Audio analysis/meters will be disabled.");
-                    latencyTestButton.disabled = true;
-                }
-
-                console.log(`Audio player state after play success: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
-                statusDiv.textContent = '状态：音频正在播放。';
-                startButton.textContent = '正在播放'; // Update button text
-                if (audioContext && audioContext.state === 'running') { // Only enable if context is good
-                    latencyTestButton.disabled = false;
-                } else {
-                    latencyTestButton.disabled = true;
-                }
-                startButton.disabled = true;
             } catch (e) {
                 console.error("Error calling audioPlayer.play() or resuming AudioContext:", e);
-                statusDiv.textContent = `状态：播放错误: ${e.message}`;
-                latencyTestButton.disabled = true; // Disable on error
+                if (statusDiv) statusDiv.textContent = `状态：播放错误: ${e.message}`;
+                if (latencyTestButton) latencyTestButton.disabled = true;
                 console.log(`Audio player state after play error: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
-                // Consider if a reconnect attempt is needed here
-                // On iOS, if play() fails due to no user interaction, this message might appear.
+                
                 if (e.name === 'NotAllowedError') {
-                    statusDiv.textContent += ' (请确保浏览器允许自动播放或在设置中启用声音)';
+                    if (statusDiv) statusDiv.textContent += ' (自动播放失败。请手动点击播放器开始播放。)';
+                    console.warn('Autoplay failed (NotAllowedError). Waiting for user to click play on the audio element.');
+                    // Add a one-time event listener for when the user manually plays
+                    audioPlayer.addEventListener('play', async () => {
+                        console.log('Audio playback started by user (via "play" event on audio element).');
+                        await initiateAudioAnalysisAndUI();
+                    }, { once: true });
+                } else {
+                    // Handle other errors (e.g., network issues, media errors)
+                    if (statusDiv) statusDiv.textContent += ' (播放时发生未知错误)';
                 }
             }
         };
@@ -327,6 +434,7 @@ async function connect() {
         console.error('Error during WebRTC negotiation:', e);
         statusDiv.textContent = `状态：连接错误: ${e.message}. 尝试重新连接...`;
         cleanupAudioAnalysis(); // Clean up audio resources on negotiation error
+        stopJitterBufferStats(); // Stop stats on error
         if (pc) {
             pc.close();
             pc = null; // Ensure pc is nullified after close
@@ -527,6 +635,7 @@ function startMeterUpdates() {
 
 function cleanupAudioAnalysis() {
     console.log("Cleaning up audio analysis resources (full).");
+    stopJitterBufferStats(); // Also stop stats collection here
     cleanupAudioAnalysisInternal(); // Disconnects nodes
     if (audioContext && audioContext.state !== 'closed') {
         audioContext.close().then(() => {
@@ -544,32 +653,54 @@ function cleanupAudioAnalysis() {
 }
 
 function applyLowLatencySettings(receiver) {
-    if (!lowLatencyToggle) { // Check if the toggle element exists
+    if (!lowLatencyToggle) {
         console.warn('Low latency toggle element not found.');
         return;
     }
 
-    if (!receiver || typeof receiver.playoutDelayHint === 'undefined') {
-        console.log('Low latency mode: playoutDelayHint API not supported by this browser or on this receiver.');
-        if (lowLatencyToggle.checked) {
-            console.warn('Low latency mode is enabled, but cannot be applied due to API unavailability.');
-        }
+    if (!receiver) {
+        console.warn('applyLowLatencySettings: Receiver not available.');
         return;
     }
 
-    if (lowLatencyToggle.checked) {
-        try {
-            receiver.playoutDelayHint = 0.02; // Use a small buffer (e.g., 20ms) for better stability
-            console.log('Low latency mode: Applied playoutDelayHint = 0.02 to receiver.');
-        } catch (e) {
-            console.error('Low latency mode: Error setting playoutDelayHint to 0.02:', e);
+    // Prefer jitterBufferTarget if available
+    if (typeof receiver.jitterBufferTarget !== 'undefined') {
+        if (lowLatencyToggle.checked) {
+            try {
+                receiver.jitterBufferTarget = 0.01; // 10ms target
+                console.log('Low latency mode: Applied jitterBufferTarget = 0.01s to receiver.');
+            } catch (e) {
+                console.error('Low latency mode: Error setting jitterBufferTarget to 0.01s:', e);
+            }
+        } else {
+            try {
+                receiver.jitterBufferTarget = null; // Revert to browser default buffering
+                console.log('Low latency mode: Cleared jitterBufferTarget (reverted to browser default).');
+            } catch (e) {
+                console.error('Low latency mode: Error clearing jitterBufferTarget:', e);
+            }
+        }
+    } else if (typeof receiver.playoutDelayHint !== 'undefined') { // Fallback to playoutDelayHint
+        console.log('Low latency mode: jitterBufferTarget not supported, falling back to playoutDelayHint.');
+        if (lowLatencyToggle.checked) {
+            try {
+                receiver.playoutDelayHint = 0.01; // 10ms hint
+                console.log('Low latency mode: Applied playoutDelayHint = 0.01 to receiver.');
+            } catch (e) {
+                console.error('Low latency mode: Error setting playoutDelayHint to 0.01:', e);
+            }
+        } else {
+            try {
+                receiver.playoutDelayHint = null;
+                console.log('Low latency mode: Cleared playoutDelayHint.');
+            } catch (e) {
+                console.error('Low latency mode: Error clearing playoutDelayHint:', e);
+            }
         }
     } else {
-        try {
-            receiver.playoutDelayHint = null; // Revert to browser default buffering
-            console.log('Low latency mode: Cleared playoutDelayHint (reverted to browser default).');
-        } catch (e) {
-            console.error('Low latency mode: Error clearing playoutDelayHint:', e);
+        console.log('Low latency mode: Neither jitterBufferTarget nor playoutDelayHint API supported.');
+        if (lowLatencyToggle.checked) {
+            console.warn('Low latency mode is enabled, but cannot be applied due to API unavailability.');
         }
     }
 }
@@ -691,6 +822,7 @@ window.addEventListener('beforeunload', () => {
     if (reconnectTimerId) {
         clearTimeout(reconnectTimerId);
     }
+    stopJitterBufferStats(); // Stop stats on page unload
     cleanupAudioAnalysis(); // Clean up audio analysis
     if (pc) {
         // Remove handlers before closing to avoid errors during shutdown
