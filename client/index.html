@@ -37,19 +37,26 @@
             margin-top: 15px;
         }
         button {
-            width: 100%;     /* Full width for mobile-first */
             box-sizing: border-box; /* Include padding and border in the element's total width and height */
-            margin: 20px 0; /* Top/bottom margin. No horizontal auto margin as it's full width */
             padding: 12px 15px;
-            background-color: #007bff;
             color: white;
             border: none;
             border-radius: 4px;
             cursor: pointer;
             font-size: 1em;
+            display: block; /* Make buttons block elements for easier centering */
         }
         button:hover {
             background-color: #0056b3;
+        }
+        #startButton {
+            background-color: #007bff;
+        }
+        #latencyTestButton {
+            background-color: #28a745; /* Kept color from original inline style */
+            padding: 10px 15px; /* Kept padding from original inline style */
+            margin: 10px auto; /* Center it */
+            width: auto; /* Allow width to adjust based on content */
         }
         #status {
             margin-top: 15px;
@@ -74,17 +81,27 @@
             h1 {
                 font-size: 1.5em;
             }
-            button {
-                font-size: 0.9em;
-                /* width: 100% is already the default from above */
+            #startButton {
+                width: 100%;
+                margin: 20px 0;
+            }
+            #latencyTestButton {
+                 /* Inherits padding and margin: auto from above */
+                 margin: 10px auto; /* Ensure centered */
+                 width: auto; /* Ensure auto width */
             }
         }
 
         /* Responsive adjustments for larger screens */
         @media (min-width: 601px) {
-            button {
+            #startButton {
                 width: 300px; /* Or a more suitable fixed width */
                 margin: 20px auto; /* Center the button */
+            }
+            #latencyTestButton {
+                /* Inherits padding and margin: auto from above */
+                margin: 10px auto; /* Ensure centered */
+                width: auto; /* Ensure auto width */
             }
         }
 
@@ -122,7 +139,19 @@
         <p>此页面将自动连接服务器以接收实时音频。如果连接断开，它将尝试自动重新连接。</p>
         <audio id="audio" controls autoplay playsinline></audio>
         <button id="startButton">开始播放</button>
+        <div style="text-align: center; margin: 10px 0;">
+            <label for="lowLatencyToggle" style="cursor: pointer;">
+                <input type="checkbox" id="lowLatencyToggle" style="vertical-align: middle;">
+                <span style="vertical-align: middle;">Low Latency Mode</span>
+            </label>
+        </div>
         <div id="status">状态：正在初始化...</div>
+
+        <div style="text-align: center; margin: 10px 0;">
+            <button id="latencyTestButton">Start Latency Test</button>
+            <div id="latencyResult" style="margin-top: 8px; font-weight: bold;">Latency: N/A</div>
+        </div>
+
         <!-- Loudness Meters (SVG) -->
         <div id="metersContainer">
             <svg id="leftMeter" class="meter-svg">

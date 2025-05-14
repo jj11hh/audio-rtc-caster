@@ -5,6 +5,9 @@ const audioPlayer = document.getElementById('audio');
 const statusDiv = document.getElementById('status');
 const leftMeterBar = document.getElementById('leftMeterBar');
 const rightMeterBar = document.getElementById('rightMeterBar');
+const lowLatencyToggle = document.getElementById('lowLatencyToggle');
+const latencyTestButton = document.getElementById('latencyTestButton');
+const latencyResultDiv = document.getElementById('latencyResult');
 
 let pc;
 let localStream; // Might be used if track needs adding to a new stream
@@ -20,6 +23,17 @@ let source = null;
 let dataArrayL = null;
 let dataArrayR = null;
 let rafId = null; // requestAnimationFrame ID
+
+// Latency Test Variables
+let pulseStartTime = 0;
+let isLatencyTestRunning = false;
+const PULSE_FREQUENCY = 1000; // Hz
+const PULSE_DURATION_SEC = 0.05; // 50ms
+const PULSE_AMPLITUDE = 0.5; // Peak amplitude of the pulse
+const PULSE_DETECTION_THRESHOLD = 0.05; // RMS threshold to detect the returning pulse. (Kept for now, but new logic uses sample threshold)
+const PULSE_SAMPLE_DETECTION_THRESHOLD = 0.02; // Threshold for individual audio samples to detect pulse arrival.
+let lastTestInitiationTime = 0;
+const MIN_TIME_BETWEEN_TESTS_MS = 2000; // Cooldown period
 
 async function connect() {
     if (reconnectTimerId) {
@@ -114,6 +128,12 @@ async function connect() {
             } catch (e) {
                 console.error('Could not get track settings:', e);
             }
+            // Apply low latency settings if applicable
+            if (event.receiver) {
+                applyLowLatencySettings(event.receiver);
+            } else {
+                console.warn('Low latency mode: event.receiver not available on track event. Cannot apply playoutDelayHint.');
+            }
         }
 
         if (event.streams && event.streams[0]) {
@@ -133,13 +153,7 @@ async function connect() {
             console.log('Audio track added to player via fallback. audioPlayer.srcObject set.');
         }
 
-        // Setup Web Audio API for meters if not already done
-        if (!audioContext && event.streams && event.streams[0]) {
-             setupAudioAnalysis(event.streams[0]);
-        } else if (!audioContext && localStream && localStream.getAudioTracks().length > 0) {
-            // Fallback if stream was constructed manually
-            setupAudioAnalysis(localStream);
-        }
+        // Web Audio API setup will be handled inside playAudio after user gesture confirmation
 
         // Log audio element state BEFORE trying to play
         console.log(`Audio player state before play attempt: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}, readyState=${audioPlayer.readyState}, networkState=${audioPlayer.networkState}`);
@@ -167,13 +181,33 @@ async function connect() {
 
                 await audioPlayer.play();
                 console.log('audioPlayer.play() promise resolved successfully.');
+
+                // Ensure AudioContext is running and setup analysis
+                if (await ensureAudioContextRunning()) {
+                    const streamForAnalysis = (event.streams && event.streams[0]) || (localStream && localStream.getAudioTracks().length > 0 ? localStream : null);
+                    if (streamForAnalysis) {
+                        setupAudioAnalysis(streamForAnalysis);
+                    } else {
+                        console.warn("No valid stream found for audio analysis setup.");
+                    }
+                } else {
+                    console.warn("AudioContext could not be started/resumed. Audio analysis/meters will be disabled.");
+                    latencyTestButton.disabled = true;
+                }
+
                 console.log(`Audio player state after play success: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
                 statusDiv.textContent = '状态：音频正在播放。';
                 startButton.textContent = '正在播放'; // Update button text
+                if (audioContext && audioContext.state === 'running') { // Only enable if context is good
+                    latencyTestButton.disabled = false;
+                } else {
+                    latencyTestButton.disabled = true;
+                }
                 startButton.disabled = true;
             } catch (e) {
                 console.error("Error calling audioPlayer.play() or resuming AudioContext:", e);
                 statusDiv.textContent = `状态：播放错误: ${e.message}`;
+                latencyTestButton.disabled = true; // Disable on error
                 console.log(`Audio player state after play error: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
                 // Consider if a reconnect attempt is needed here
                 // On iOS, if play() fails due to no user interaction, this message might appear.
@@ -298,6 +332,7 @@ async function connect() {
             pc = null; // Ensure pc is nullified after close
         }
         startButton.disabled = false;
+        latencyTestButton.disabled = true;
         startButton.textContent = '重新连接';
         if (!reconnectTimerId) {
             console.log(`Negotiation error. Attempting to reconnect in ${reconnectInterval / 1000}s...`);
@@ -307,54 +342,108 @@ async function connect() {
 
 }
 
-function setupAudioAnalysis(stream) {
-    console.log('Setting up Web Audio analysis for meters...');
-    try {
-        if (audioContext) {
-            console.log("AudioContext already exists. Closing previous one.");
-            audioContext.close(); // Close existing context before creating new
+async function ensureAudioContextRunning() {
+    if (!audioContext) {
+        console.log("AudioContext is null, creating new one (triggered by user gesture or allowed autoplay).");
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            console.log("AudioContext created, state:", audioContext.state);
+        } catch (e) {
+            console.error("Failed to create AudioContext:", e);
+            if (statusDiv) statusDiv.textContent += ' (Error: Audio system init failed.)';
+            if (latencyTestButton) latencyTestButton.disabled = true;
+            return false;
         }
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
 
-        // Check if the stream has audio tracks
+    if (audioContext.state === 'suspended') {
+        console.log("AudioContext is suspended, attempting to resume...");
+        try {
+            await audioContext.resume();
+            console.log("AudioContext resumed, state:", audioContext.state);
+        } catch (e) {
+            console.error("Failed to resume AudioContext:", e);
+            if (statusDiv) statusDiv.textContent += ' (Error: Could not resume audio.)';
+            if (latencyTestButton) latencyTestButton.disabled = true;
+            return false;
+        }
+    }
+
+    if (audioContext.state === 'running') {
+        return true;
+    } else {
+        console.warn("AudioContext not running after creation/resume attempt. State:", audioContext.state);
+        if (latencyTestButton) latencyTestButton.disabled = true;
+        return false;
+    }
+}
+
+function setupAudioAnalysis(stream) {
+    if (!audioContext || audioContext.state !== 'running') {
+        console.log('setupAudioAnalysis: AudioContext not available or not running. Aborting setup.');
+        return;
+    }
+
+    if (source && source.mediaStream === stream) {
+        console.log("setupAudioAnalysis: Already initialized with the same stream.");
+        return;
+    }
+
+    if (source) {
+        console.log("setupAudioAnalysis: Stream changed or re-initializing nodes.");
+        cleanupAudioAnalysisInternal();
+    } else {
+        console.log("setupAudioAnalysis: Initializing nodes for stream:", stream);
+    }
+    
+    try {
         if (!stream || stream.getAudioTracks().length === 0) {
             console.error("Stream has no audio tracks for analysis.");
-            if (audioContext) audioContext.close();
-            audioContext = null;
+            // Don't close/nullify audioContext here as it's managed by ensureAudioContextRunning
             return;
         }
         
         source = audioContext.createMediaStreamSource(stream);
-        splitter = audioContext.createChannelSplitter(2); // Assume stereo
+        splitter = audioContext.createChannelSplitter(2);
         analyserL = audioContext.createAnalyser();
-        analyserL.fftSize = 256; // Smaller FFT size for faster processing
+        analyserL.fftSize = 256;
         analyserR = audioContext.createAnalyser();
         analyserR.fftSize = 256;
 
-        // Connect nodes: source -> splitter -> analysers
         source.connect(splitter);
-        splitter.connect(analyserL, 0); // Connect channel 0 (Left) to analyserL
-        splitter.connect(analyserR, 1); // Connect channel 1 (Right) to analyserR
-        // Note: We don't connect analysers to destination, we just read data
+        splitter.connect(analyserL, 0);
+        splitter.connect(analyserR, 1);
 
-        // Prepare data arrays
-        const bufferLengthL = analyserL.frequencyBinCount; // or analyserL.fftSize for time domain
-        dataArrayL = new Float32Array(bufferLengthL); // Use Float32Array for time domain data
-        const bufferLengthR = analyserR.frequencyBinCount;
+        const bufferLengthL = analyserL.fftSize;
+        dataArrayL = new Float32Array(bufferLengthL);
+        const bufferLengthR = analyserR.fftSize;
         dataArrayR = new Float32Array(bufferLengthR);
 
         console.log('Audio analysis nodes created and connected.');
-
-        // Start updating meters
         startMeterUpdates();
 
     } catch (e) {
-        console.error('Error setting up Web Audio API:', e);
-        statusDiv.textContent += ' (无法初始化音频分析)';
-        // Clean up partially created context
-        if (audioContext) audioContext.close();
-        audioContext = null;
+        console.error('Error setting up Web Audio API nodes:', e);
+        if (statusDiv) statusDiv.textContent += ' (无法初始化音频分析节点)';
+        cleanupAudioAnalysisInternal(); // Clean up any partially created nodes
+        if (latencyTestButton) latencyTestButton.disabled = true;
     }
+}
+
+function cleanupAudioAnalysisInternal() {
+    console.log("Cleaning up audio analysis nodes (internal).");
+    stopMeterUpdates();
+    if (source) {
+        try { source.disconnect(); } catch(e) { console.warn("Error disconnecting source:", e); }
+        source = null;
+    }
+    if (splitter) {
+        try { splitter.disconnect(); } catch(e) { console.warn("Error disconnecting splitter:", e); }
+        splitter = null;
+    }
+    analyserL = null;
+    analyserR = null;
+    // dataArrayL and dataArrayR are nulled in the main cleanup or re-created in setup
 }
 
 function stopMeterUpdates() {
@@ -400,6 +489,35 @@ function startMeterUpdates() {
         leftMeterBar.setAttribute('width', percentL + '%');
         rightMeterBar.setAttribute('width', percentR + '%');
 
+        // Latency Test Pulse Detection (New Logic)
+        if (isLatencyTestRunning && audioContext && audioContext.state === 'running' && dataArrayL) {
+            const frameCurrentTime = audioContext.currentTime; // Capture AudioContext time for this frame of analysis
+
+            for (let i = 0; i < dataArrayL.length; i++) {
+                if (Math.abs(dataArrayL[i]) > PULSE_SAMPLE_DETECTION_THRESHOLD) {
+                    // Estimate the actual time the detected sample occurred
+                    // dataArrayL contains 'dataArrayL.length' samples.
+                    // The last sample (index dataArrayL.length - 1) corresponds most closely to 'frameCurrentTime'.
+                    // Sample 'i' occurred (dataArrayL.length - 1 - i) samples *before* the last sample in the buffer.
+                    const samplesBeforeEndOfBuffer = dataArrayL.length - 1 - i;
+                    const timeBeforeEndOfBuffer = samplesBeforeEndOfBuffer / audioContext.sampleRate;
+                    
+                    const pulseEventTime = frameCurrentTime - timeBeforeEndOfBuffer;
+                    const latencyMs = (pulseEventTime - pulseStartTime) * 1000;
+
+                    console.log(`Pulse sample detected at index ${i}. Value: ${dataArrayL[i].toFixed(4)}. Est. Event Time: ${pulseEventTime.toFixed(3)} (Frame time: ${frameCurrentTime.toFixed(3)}), Start: ${pulseStartTime.toFixed(3)}, Latency: ${latencyMs.toFixed(2)} ms`);
+                    
+                    if (latencyResultDiv) {
+                        latencyResultDiv.textContent = `Latency: ${latencyMs.toFixed(2)} ms`;
+                    }
+                    isLatencyTestRunning = false; // Stop test
+                    latencyTestButton.disabled = false; // Re-enable button
+                    // No need to update lastTestInitiationTime here, that's for starting
+                    break; // Exit loop once pulse is detected
+                }
+            }
+        }
+
         // Schedule next update
         rafId = requestAnimationFrame(updateMeters);
     };
@@ -408,25 +526,52 @@ function startMeterUpdates() {
 }
 
 function cleanupAudioAnalysis() {
-    console.log("Cleaning up audio analysis resources.");
-    stopMeterUpdates();
-    if (source) {
-        source.disconnect();
-        source = null;
-    }
-    if (splitter) {
-        splitter.disconnect();
-        splitter = null;
-    }
-    // Analysers don't need explicit disconnect if source is disconnected
-    analyserL = null;
-    analyserR = null;
+    console.log("Cleaning up audio analysis resources (full).");
+    cleanupAudioAnalysisInternal(); // Disconnects nodes
     if (audioContext && audioContext.state !== 'closed') {
-        audioContext.close().then(() => console.log("AudioContext closed."));
+        audioContext.close().then(() => {
+            console.log("AudioContext closed.");
+            audioContext = null; // Nullify after successful close
+        }).catch(e => {
+            console.error("Error closing AudioContext:", e);
+            audioContext = null; // Still nullify on error
+        });
+    } else {
+        audioContext = null; // Ensure it's null if already closed or never existed
     }
-    audioContext = null;
     dataArrayL = null;
     dataArrayR = null;
+}
+
+function applyLowLatencySettings(receiver) {
+    if (!lowLatencyToggle) { // Check if the toggle element exists
+        console.warn('Low latency toggle element not found.');
+        return;
+    }
+
+    if (!receiver || typeof receiver.playoutDelayHint === 'undefined') {
+        console.log('Low latency mode: playoutDelayHint API not supported by this browser or on this receiver.');
+        if (lowLatencyToggle.checked) {
+            console.warn('Low latency mode is enabled, but cannot be applied due to API unavailability.');
+        }
+        return;
+    }
+
+    if (lowLatencyToggle.checked) {
+        try {
+            receiver.playoutDelayHint = 0.02; // Use a small buffer (e.g., 20ms) for better stability
+            console.log('Low latency mode: Applied playoutDelayHint = 0.02 to receiver.');
+        } catch (e) {
+            console.error('Low latency mode: Error setting playoutDelayHint to 0.02:', e);
+        }
+    } else {
+        try {
+            receiver.playoutDelayHint = null; // Revert to browser default buffering
+            console.log('Low latency mode: Cleared playoutDelayHint (reverted to browser default).');
+        } catch (e) {
+            console.error('Low latency mode: Error clearing playoutDelayHint:', e);
+        }
+    }
 }
 
 // Note: The pc.oniceconnectionstatechange handler was already correctly defined
@@ -435,11 +580,111 @@ function cleanupAudioAnalysis() {
 
 startButton.onclick = connect;
 
-// Auto-connect on page load
-window.addEventListener('load', () => {
-    console.log('Page loaded. Attempting to connect...');
-    connect();
-});
+if (lowLatencyToggle) {
+    lowLatencyToggle.addEventListener('change', () => {
+        console.log(`Low latency mode toggled: ${lowLatencyToggle.checked}`);
+        if (pc && (pc.connectionState === 'connected' || pc.connectionState === 'completed')) {
+            const receivers = pc.getReceivers();
+            receivers.forEach(receiver => {
+                if (receiver.track && receiver.track.kind === 'audio') {
+                    // applyLowLatencySettings already checks for playoutDelayHint support
+                    applyLowLatencySettings(receiver);
+                }
+            });
+        } else { // Corrected brace placement and paired else
+            console.log('Low latency mode: Toggle changed, but no active WebRTC connection. Setting will be used on next connection via ontrack.');
+        }
+    });
+} // Moved functions and button assignment outside this listener
+
+function playClientPulse() {
+    if (!audioContext || audioContext.state !== 'running') {
+        console.warn('Cannot play pulse: AudioContext not available or not running.');
+        if (latencyResultDiv) latencyResultDiv.textContent = 'Latency: Error (Audio Offline)';
+        latencyTestButton.disabled = false;
+        isLatencyTestRunning = false;
+        return;
+    }
+
+    console.log('Playing client pulse...');
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(PULSE_FREQUENCY, audioContext.currentTime);
+
+    gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+    gainNode.gain.linearRampToValueAtTime(PULSE_AMPLITUDE, audioContext.currentTime + PULSE_DURATION_SEC / 5); // Quick ramp up
+    gainNode.gain.setValueAtTime(PULSE_AMPLITUDE, audioContext.currentTime + PULSE_DURATION_SEC * 4 / 5);
+    gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + PULSE_DURATION_SEC); // Quick ramp down
+
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination); // Play directly to output
+
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + PULSE_DURATION_SEC + 0.01); // Stop slightly after pulse ends
+
+    // For latency measurement, pulseStartTime is recorded just before calling this.
+    console.log(`Pulse initiated at audioContext.currentTime: ${pulseStartTime.toFixed(3)}`);
+}
+
+async function handleLatencyTest() { // Made async
+    console.log('handleLatencyTest function entered.');
+    const now = performance.now();
+    if (now - lastTestInitiationTime < MIN_TIME_BETWEEN_TESTS_MS) {
+        console.log(`Latency test skipped: Cooldown period active. Wait ${((MIN_TIME_BETWEEN_TESTS_MS - (now - lastTestInitiationTime))/1000).toFixed(1)}s.`);
+        if (latencyResultDiv) latencyResultDiv.textContent = `Latency: Cooldown...`;
+        return;
+    }
+
+    if (!await ensureAudioContextRunning()) {
+        console.error('Cannot start latency test: AudioContext could not be started/resumed.');
+        if (latencyResultDiv) latencyResultDiv.textContent = 'Latency: Error (Audio Offline)';
+        isLatencyTestRunning = false;
+        latencyTestButton.disabled = false;
+        return;
+    }
+    
+    // Ensure analysers are set up for pulse detection
+    if (!analyserL || !dataArrayL) { // Check if analysis components are ready
+        console.error('Cannot start latency test: Audio analysis (analyserL or dataArrayL) not set up.');
+        if (latencyResultDiv) latencyResultDiv.textContent = 'Latency: Error (Analyser N/A)';
+        isLatencyTestRunning = false;
+        latencyTestButton.disabled = false;
+        return;
+    }
+
+    if (isLatencyTestRunning) {
+        console.log('Latency test already in progress.');
+        return;
+    }
+
+    console.log('Starting latency test...');
+    isLatencyTestRunning = true;
+    lastTestInitiationTime = now;
+    latencyTestButton.disabled = true;
+    if (latencyResultDiv) latencyResultDiv.textContent = 'Latency: Testing...';
+
+    // Record start time just before playing the pulse
+    // audioContext.currentTime provides a high-resolution timestamp relative to the AudioContext's own clock
+    pulseStartTime = audioContext.currentTime;
+    playClientPulse();
+
+    // Set a timeout to stop the test if no pulse is detected, to prevent button remaining disabled
+    setTimeout(() => {
+        if (isLatencyTestRunning) {
+            console.warn('Latency test timed out. No returning pulse detected.');
+            if (latencyResultDiv) latencyResultDiv.textContent = 'Latency: Timeout';
+            isLatencyTestRunning = false;
+            latencyTestButton.disabled = false;
+        }
+    }, 5000); // 5-second timeout for pulse detection
+}
+
+latencyTestButton.disabled = true; // Initially disabled until connection is up
+latencyTestButton.onclick = handleLatencyTest;
+
+// Auto-connect on page load has been removed. User must click "Start".
 
 // Clean up on page unload
 window.addEventListener('beforeunload', () => {
