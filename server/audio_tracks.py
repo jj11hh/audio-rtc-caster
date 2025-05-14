@@ -262,7 +262,7 @@ class SineWaveTrack(BaseAudioTrack):
         used for an asyncio.sleep, which is now removed to potentially
         improve smoothness as the consumer should handle pacing.
         """
-        pass # Removed: await asyncio.sleep(self._frame_duration_seconds)
+        await asyncio.sleep(self._frame_duration_seconds)
 
     def stop(self):
         super().stop() # Sets _stop_event
