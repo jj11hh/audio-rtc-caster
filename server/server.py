@@ -18,7 +18,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("pc")
+logger = logging.getLogger("server")
 
 ROOT = os.path.dirname(__file__)
 CLIENT_DIR = os.path.join(os.path.dirname(ROOT), "client") # ../client
