@@ -135,17 +135,16 @@
 </head>
 <body>
     <div id="container">
-        <h1>WebRTC 实时音频播放</h1>
-        <p>此页面将自动连接服务器以接收实时音频。如果连接断开，它将尝试自动重新连接。</p>
+        <h1>WebRTC Real-time Audio Playback</h1>
         <audio id="audio" controls playsinline></audio>
-        <button id="startButton">开始播放</button>
+        <button id="startButton">Start Playback</button>
         <div style="text-align: center; margin: 10px 0;">
             <label for="lowLatencyToggle" style="cursor: pointer;">
                 <input type="checkbox" id="lowLatencyToggle" style="vertical-align: middle;">
                 <span style="vertical-align: middle;">Low Latency Mode</span>
             </label>
         </div>
-        <div id="status">状态：正在初始化...</div>
+        <div id="status">Status: Not Connected</div>
 
         <div style="text-align: center; margin: 10px 0;">
             <button id="latencyTestButton">Start Latency Test</button>

@@ -55,13 +55,13 @@ async function connect() {
 
     if (pc && pc.connectionState !== "closed" && pc.connectionState !== "failed" && pc.connectionState !== "new") {
         console.log('Already connected or connecting. Current state:', pc.connectionState);
-        statusDiv.textContent = '状态：已经连接或正在连接中。';
+        statusDiv.textContent = 'Status: Already connected or connecting.';
         return;
     }
-    
-    statusDiv.textContent = '状态：正在连接...';
+
+    statusDiv.textContent = 'Status: Connecting...';
     startButton.disabled = true;
-    startButton.textContent = '正在连接...';
+    startButton.textContent = 'Connecting...';
 
     // Clean up previous connection if any
     if (pc) {
@@ -75,9 +75,9 @@ async function connect() {
     const RTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
     if (!RTCPeerConnection) {
         console.error("RTCPeerConnection API is not supported by this browser.");
-        statusDiv.textContent = '状态：错误 - WebRTC 不受支持。';
+        statusDiv.textContent = 'Status: Error - WebRTC not supported.';
         startButton.disabled = false;
-        startButton.textContent = '开始播放';
+        startButton.textContent = 'Start Playback';
         return;
     }
     pc = new RTCPeerConnection(configuration);
@@ -90,12 +90,12 @@ async function connect() {
 
     pc.oniceconnectionstatechange = event => {
         console.log('ICE connection state change:', pc.iceConnectionState);
-        statusDiv.textContent = `状态：ICE 连接状态: ${pc.iceConnectionState}`;
+        statusDiv.textContent = `Status: ICE connection state: ${pc.iceConnectionState}`;
         switch (pc.iceConnectionState) {
             case 'connected':
             case 'completed':
-                statusDiv.textContent = '状态：已连接。';
-                startButton.textContent = '已连接';
+                statusDiv.textContent = 'Status: Connected.';
+                startButton.textContent = 'Connected';
                 startButton.disabled = true; // Keep disabled while connected
                 if (reconnectTimerId) {
                     clearTimeout(reconnectTimerId);
@@ -104,7 +104,7 @@ async function connect() {
                 startJitterBufferStats(); // Start collecting stats
                 break;
             case 'disconnected':
-                statusDiv.textContent = '状态：连接已断开。尝试重新连接...';
+                statusDiv.textContent = 'Status: Disconnected. Attempting to reconnect...';
                 // Browsers might automatically try to reconnect. If not, we can trigger.
                 // For now, rely on 'failed' or 'closed' for explicit reconnect logic.
                 // Attempt to reconnect if disconnected
@@ -115,10 +115,10 @@ async function connect() {
                 stopJitterBufferStats(); // Stop collecting stats
                 break;
             case 'failed':
-                statusDiv.textContent = '状态：连接失败。请检查服务器和网络。尝试重新连接...';
+                statusDiv.textContent = 'Status: Connection failed. Please check server and network. Attempting to reconnect...';
                 if (pc) pc.close();
                 startButton.disabled = false;
-                startButton.textContent = '重新连接';
+                startButton.textContent = 'Reconnect';
                 if (!reconnectTimerId) {
                     console.log(`ICE failed. Attempting to reconnect in ${reconnectInterval / 1000}s...`);
                     reconnectTimerId = setTimeout(connect, reconnectInterval);
@@ -126,9 +126,9 @@ async function connect() {
                 stopJitterBufferStats(); // Stop collecting stats
                 break;
             case 'closed':
-                statusDiv.textContent = '状态：连接已关闭。';
+                statusDiv.textContent = 'Status: Connection closed.';
                 startButton.disabled = false;
-                startButton.textContent = '开始播放';
+                startButton.textContent = 'Start Playback';
                 // Do not automatically reconnect if closed by user/application
                 if (reconnectTimerId) {
                     clearTimeout(reconnectTimerId);
@@ -231,7 +231,7 @@ async function connect() {
         if (event.streams && event.streams[0]) {
             console.log('Attaching stream to audio player:', event.streams[0]);
             audioPlayer.srcObject = event.streams[0];
-            statusDiv.textContent = '状态：正在接收音频...';
+            statusDiv.textContent = 'Status: Receiving audio...';
             console.log('Audio stream attached to player. audioPlayer.srcObject set.');
         } else {
             console.log('Using fallback to attach track to player.');
@@ -241,7 +241,7 @@ async function connect() {
             }
             localStream.addTrack(track);
             audioPlayer.srcObject = localStream;
-            statusDiv.textContent = '状态：正在接收音频 (fallback)...';
+            statusDiv.textContent = 'Status: Receiving audio (fallback)...';
             console.log('Audio track added to player via fallback. audioPlayer.srcObject set.');
         }
 
@@ -276,9 +276,9 @@ async function connect() {
             }
 
             console.log(`Audio player state after play success: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
-            if (statusDiv) statusDiv.textContent = '状态：音频正在播放。';
+            if (statusDiv) statusDiv.textContent = 'Status: Audio is playing.';
             if (startButton) {
-                startButton.textContent = '正在播放'; // Update button text
+                startButton.textContent = 'Now Playing'; // Update button text
                 startButton.disabled = true;
             }
             if (latencyTestButton) {
@@ -305,12 +305,12 @@ async function connect() {
 
             } catch (e) {
                 console.error("Error calling audioPlayer.play() or resuming AudioContext:", e);
-                if (statusDiv) statusDiv.textContent = `状态：播放错误: ${e.message}`;
+                if (statusDiv) statusDiv.textContent = `Status: Playback error: ${e.message}`;
                 if (latencyTestButton) latencyTestButton.disabled = true;
                 console.log(`Audio player state after play error: muted=${audioPlayer.muted}, paused=${audioPlayer.paused}, volume=${audioPlayer.volume}`);
-                
+
                 if (e.name === 'NotAllowedError') {
-                    if (statusDiv) statusDiv.textContent += ' (自动播放失败。请手动点击播放器开始播放。)';
+                    if (statusDiv) statusDiv.textContent += ' (Autoplay failed. Please manually click the player to start playback.)';
                     console.warn('Autoplay failed (NotAllowedError). Waiting for user to click play on the audio element.');
                     // Add a one-time event listener for when the user manually plays
                     audioPlayer.addEventListener('play', async () => {
@@ -319,14 +319,14 @@ async function connect() {
                     }, { once: true });
                 } else {
                     // Handle other errors (e.g., network issues, media errors)
-                    if (statusDiv) statusDiv.textContent += ' (播放时发生未知错误)';
+                    if (statusDiv) statusDiv.textContent += ' (An unknown error occurred during playback)';
                 }
             }
         };
 
         playAudio();
     };
-    
+
     pc.addTransceiver('audio', { direction: 'recvonly' });
 
     try {
@@ -427,12 +427,12 @@ async function connect() {
         console.log(answer.sdp);
         console.log('--- END SDP ANSWER ---');
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        statusDiv.textContent = '状态：已连接，等待音频流...';
+        statusDiv.textContent = 'Status: Connected, waiting for audio stream...';
         // startButton.disabled = true; // Already handled in oniceconnectionstatechange
 
     } catch (e) {
         console.error('Error during WebRTC negotiation:', e);
-        statusDiv.textContent = `状态：连接错误: ${e.message}. 尝试重新连接...`;
+        statusDiv.textContent = `Status: Connection error: ${e.message}. Attempting to reconnect...`;
         cleanupAudioAnalysis(); // Clean up audio resources on negotiation error
         stopJitterBufferStats(); // Stop stats on error
         if (pc) {
@@ -441,7 +441,7 @@ async function connect() {
         }
         startButton.disabled = false;
         latencyTestButton.disabled = true;
-        startButton.textContent = '重新连接';
+        startButton.textContent = 'Reconnect';
         if (!reconnectTimerId) {
             console.log(`Negotiation error. Attempting to reconnect in ${reconnectInterval / 1000}s...`);
             reconnectTimerId = setTimeout(connect, reconnectInterval);
@@ -503,14 +503,14 @@ function setupAudioAnalysis(stream) {
     } else {
         console.log("setupAudioAnalysis: Initializing nodes for stream:", stream);
     }
-    
+
     try {
         if (!stream || stream.getAudioTracks().length === 0) {
             console.error("Stream has no audio tracks for analysis.");
             // Don't close/nullify audioContext here as it's managed by ensureAudioContextRunning
             return;
         }
-        
+
         source = audioContext.createMediaStreamSource(stream);
         splitter = audioContext.createChannelSplitter(2);
         analyserL = audioContext.createAnalyser();
@@ -532,7 +532,7 @@ function setupAudioAnalysis(stream) {
 
     } catch (e) {
         console.error('Error setting up Web Audio API nodes:', e);
-        if (statusDiv) statusDiv.textContent += ' (无法初始化音频分析节点)';
+        if (statusDiv) statusDiv.textContent += ' (Could not initialize audio analysis nodes)';
         cleanupAudioAnalysisInternal(); // Clean up any partially created nodes
         if (latencyTestButton) latencyTestButton.disabled = true;
     }
@@ -609,12 +609,12 @@ function startMeterUpdates() {
                     // Sample 'i' occurred (dataArrayL.length - 1 - i) samples *before* the last sample in the buffer.
                     const samplesBeforeEndOfBuffer = dataArrayL.length - 1 - i;
                     const timeBeforeEndOfBuffer = samplesBeforeEndOfBuffer / audioContext.sampleRate;
-                    
+
                     const pulseEventTime = frameCurrentTime - timeBeforeEndOfBuffer;
                     const latencyMs = (pulseEventTime - pulseStartTime) * 1000;
 
                     console.log(`Pulse sample detected at index ${i}. Value: ${dataArrayL[i].toFixed(4)}. Est. Event Time: ${pulseEventTime.toFixed(3)} (Frame time: ${frameCurrentTime.toFixed(3)}), Start: ${pulseStartTime.toFixed(3)}, Latency: ${latencyMs.toFixed(2)} ms`);
-                    
+
                     if (latencyResultDiv) {
                         latencyResultDiv.textContent = `Latency: ${latencyMs.toFixed(2)} ms`;
                     }
@@ -775,7 +775,7 @@ async function handleLatencyTest() { // Made async
         latencyTestButton.disabled = false;
         return;
     }
-    
+
     // Ensure analysers are set up for pulse detection
     if (!analyserL || !dataArrayL) { // Check if analysis components are ready
         console.error('Cannot start latency test: Audio analysis (analyserL or dataArrayL) not set up.');
