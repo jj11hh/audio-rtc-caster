@@ -72,10 +72,11 @@ class WebRTCServer:
                 self.pcs.discard(pc)
 
         if self.audio_track:
-            sender = pc.addTrack(self.audio_track)
-            logger.info(f"Audio track added directly to PC. Sender: {sender}, Sender Track: {sender.track}")
+            relayed_track = self.relay.subscribe(self.audio_track)
+            sender = pc.addTrack(relayed_track)
+            logger.info(f"Subscribed to relay and added track to PC. Sender: {sender}, Sender Track (Relayed): {sender.track}")
             if sender.track:
-                logger.info(f"  Directly added track kind: {sender.track.kind}, id: {sender.track.id}")
+                logger.info(f"  Relayed track kind: {sender.track.kind}, id: {sender.track.id}. Original track: {self.audio_track.id if self.audio_track else 'N/A'}")
         else:
             logger.warning("No audio track available to add to PC (offer method). This might be expected if it's initialized in on_startup.")
 
