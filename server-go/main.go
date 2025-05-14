@@ -15,10 +15,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-ole/go-ole" // For CoInitialize/CoUninitialize
 	"github.com/google/uuid"
-	"github.com/go-ole/go-ole"            // For CoInitialize/CoUninitialize
 	"github.com/pion/webrtc/v4"           // Updated to v4
 	"github.com/pion/webrtc/v4/pkg/media" // Updated to v4
+	"gopkg.in/hraban/opus.v2"
 )
 
 // AppConfig holds all command-line arguments
@@ -36,6 +37,7 @@ type AppConfig struct {
 }
 
 var appConfig AppConfig // Global application configuration
+var opusEncoder *opus.Encoder
 
 // TrackManager holds the list of active audio tracks and a mutex for synchronization.
 type TrackManager struct {
@@ -79,23 +81,28 @@ func (tm *TrackManager) WriteSampleToAllTracks(sample media.Sample) {
 	defer tm.mu.Unlock()
 
 	if len(tm.tracks) == 0 {
+		// log.Println("TrackManager.WriteSampleToAllTracks: No tracks to write to.") // Can be verbose
 		return
 	}
+	// log.Printf("TrackManager.WriteSampleToAllTracks: Writing sample (len: %d, dur: %v) to %d tracks", len(sample.Data), sample.Duration, len(tm.tracks))
 
 	tracksToRemove := []string{}
 	for id, track := range tm.tracks {
+		log.Printf("TrackManager.WriteSampleToAllTracks: Attempting to write to track %s (Sample len: %d, dur: %v)", id, len(sample.Data), sample.Duration)
 		if err := track.WriteSample(sample); err != nil {
 			// media.ErrClosedPipe might not be exported or could have changed.
 			// The string checks are more robust for identifying closed pipe scenarios.
 			if strings.Contains(err.Error(), "use of closed network connection") ||
-			   strings.Contains(err.Error(), "srtp: RtpSender is closed") ||
-			   strings.Contains(err.Error(), "io: read/write on closed pipe") || // Common generic pipe error
-			   strings.Contains(err.Error(), "broken pipe") { // Another common one
+				strings.Contains(err.Error(), "srtp: RtpSender is closed") ||
+				strings.Contains(err.Error(), "io: read/write on closed pipe") || // Common generic pipe error
+				strings.Contains(err.Error(), "broken pipe") { // Another common one
 				log.Printf("Track %s connection closed (err: %v), scheduling for removal.", id, err)
 				tracksToRemove = append(tracksToRemove, id)
 			} else {
 				log.Printf("Error writing sample to track %s: %v", id, err)
 			}
+		} else {
+			log.Printf("TrackManager.WriteSampleToAllTracks: Successfully wrote to track %s", id)
 		}
 	}
 
@@ -124,22 +131,26 @@ func getCodecCapability(codecName string, sourceSampleRate uint32, sourceChannel
 		if cliCfg.OpusMaxAverageBitrate > 0 { // If user sets this CLI flag
 			opusFmtpParams = append(opusFmtpParams, "maxaveragebitrate="+strconv.Itoa(cliCfg.OpusMaxAverageBitrate))
 		}
+
 		if cliCfg.OpusCBR { // Default false in AppConfig
 			opusFmtpParams = append(opusFmtpParams, "cbr=1")
 		}
-		if cliCfg.OpusUseDTX { // Default true in AppConfig
+		if cliCfg.SineWave {
 			opusFmtpParams = append(opusFmtpParams, "usedtx=1")
+		} else {
+			opusFmtpParams = append(opusFmtpParams, "usedtx=0") // Explicitly disable DTX
 		}
 
-		// Opus is typically stereo with WebRTC. We hardcode Channels: 2.
-		// Include stereo parameters in fmtp line to make it explicit.
-		opusFmtpParams = append(opusFmtpParams, "stereo=1")
-		opusFmtpParams = append(opusFmtpParams, "sprop-stereo=1") // Often paired with stereo=1
+		if sourceChannels == 2 {
+			opusFmtpParams = append(opusFmtpParams, "stereo=1")
+			opusFmtpParams = append(opusFmtpParams, "sprop-stereo=1") // Often paired with stereo=1
+		}
 
+		// opus/48000/2 is forced by RTC7587, We will return real channels with fmtp parameters
 		return webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeOpus,
-			ClockRate:   48000, // Opus standard clock rate
-			Channels:    2,     // Opus is typically stereo
+			ClockRate:   48000,
+			Channels:    2,
 			SDPFmtpLine: strings.Join(opusFmtpParams, ";"),
 		}
 	case "pcmu":
@@ -149,26 +160,7 @@ func getCodecCapability(codecName string, sourceSampleRate uint32, sourceChannel
 	case "g722":
 		return webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeG722, ClockRate: 8000, Channels: sourceChannels}
 	default:
-		log.Printf("Unsupported preferred codec: %s, defaulting to Opus using CLI config.", codecName)
-		// Construct default Opus capability using the same logic as the "opus" case
-		// This requires calling the Opus construction logic, effectively like:
-		// return getCodecCapability("opus", sourceSampleRate, sourceChannels, cliCfg)
-		// For simplicity and to avoid recursion if "opus" itself was the unknown, explicitly reconstruct.
-		opusFmtpParams := []string{}
-		if cliCfg.OpusUseInbandFEC { opusFmtpParams = append(opusFmtpParams, "useinbandfec=1") }
-		opusFmtpParams = append(opusFmtpParams, "minptime=10")
-		if cliCfg.OpusMaxPlaybackRate > 0 { opusFmtpParams = append(opusFmtpParams, "maxplaybackrate="+strconv.Itoa(cliCfg.OpusMaxPlaybackRate)) }
-		if cliCfg.OpusMaxAverageBitrate > 0 { opusFmtpParams = append(opusFmtpParams, "maxaveragebitrate="+strconv.Itoa(cliCfg.OpusMaxAverageBitrate)) }
-		if cliCfg.OpusCBR { opusFmtpParams = append(opusFmtpParams, "cbr=1") }
-		if cliCfg.OpusUseDTX { opusFmtpParams = append(opusFmtpParams, "usedtx=1") }
-		opusFmtpParams = append(opusFmtpParams, "stereo=1")
-		opusFmtpParams = append(opusFmtpParams, "sprop-stereo=1")
-		return webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeOpus,
-			ClockRate:   48000,
-			Channels:    2,
-			SDPFmtpLine: strings.Join(opusFmtpParams, ";"),
-		}
+		return webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 8000, Channels: sourceChannels}
 	}
 }
 
@@ -194,6 +186,7 @@ func startSineWaveGenerator(config *AudioCaptureConfig) <-chan []byte {
 		}
 		log.Printf("Sine wave generator: SR=%d, CH=%d, FramesPerBuffer=%d, BufferDuration=%v",
 			config.SampleRate, config.Channels, config.FramesPerBuffer, bufferDuration)
+		log.Printf("Sine wave generator: Ticker set to %v", bufferDuration)
 
 		ticker := time.NewTicker(bufferDuration)
 		defer ticker.Stop()
@@ -221,12 +214,13 @@ func startSineWaveGenerator(config *AudioCaptureConfig) <-chan []byte {
 
 				select {
 				case audioChan <- byteData:
+					// log.Printf("Sine wave generator: Sent %d bytes to audioChan", len(byteData)) // Can be very verbose
 				default:
 					log.Println("Sine wave audio channel full, discarding packet.")
 				}
-			// TODO: Add a way to stop this goroutine cleanly, e.g., via a quit channel.
-			// For now, it stops when audioChan's reader (main audio processing goroutine) stops.
-			// Or if DefaultAudioCapture.Stop() is adapted to signal this too for shutdown.
+				// TODO: Add a way to stop this goroutine cleanly, e.g., via a quit channel.
+				// For now, it stops when audioChan's reader (main audio processing goroutine) stops.
+				// Or if DefaultAudioCapture.Stop() is adapted to signal this too for shutdown.
 			}
 		}
 	}()
@@ -237,7 +231,6 @@ func startSineWaveGenerator(config *AudioCaptureConfig) <-chan []byte {
 // SDP modification was removed as it's incompatible with pion/webrtc's SetLocalDescription requirements.
 // The SDP from CreateAnswer must be used directly.
 
-
 func main() {
 	// Define CLI flags
 	flag.BoolVar(&appConfig.SineWave, "sine-wave", false, "Stream a 440Hz sine wave instead of system audio.")
@@ -247,7 +240,7 @@ func main() {
 	flag.IntVar(&appConfig.OpusMaxPlaybackRate, "opus-maxplaybackrate", 48000, "Opus specific: Sets 'maxplaybackrate' (e.g., 48000 for fullband default).")
 	flag.BoolVar(&appConfig.OpusCBR, "opus-cbr", false, "Opus specific: Enable constant bitrate ('cbr=1').")
 	flag.BoolVar(&appConfig.OpusUseInbandFEC, "opus-useinbandfec", true, "Opus specific: Enable inband Forward Error Correction ('useinbandfec=1').") // Default true in Python
-	flag.BoolVar(&appConfig.OpusUseDTX, "opus-usedtx", true, "Opus specific: Enable Discontinuous Transmission ('usedtx=1').")         // Default true in Python
+	flag.BoolVar(&appConfig.OpusUseDTX, "opus-usedtx", true, "Opus specific: Enable Discontinuous Transmission ('usedtx=1').")                        // Default true in Python
 	flag.StringVar(&appConfig.Port, "port", "8088", "Port for the HTTP server.")
 	flag.Parse()
 
@@ -280,25 +273,90 @@ func main() {
 		// The Codec for the track itself will be based on appConfig.PreferredCodec.
 		sineSR := uint32(48000)
 		sineCH := uint16(1) // Python's SineWaveTrack is mono by default. Opus track will still be stereo if preferred codec is Opus.
-		                   // getCodecCapability handles channel count for Opus (forces to 2) and takes appConfig.
+		// getCodecCapability handles channel count for Opus (forces to 2) and takes appConfig.
 		codecForSine := getCodecCapability(appConfig.PreferredCodec, sineSR, sineCH, appConfig)
 		currentCaptureConfig = &AudioCaptureConfig{
 			SampleRate:      sineSR,
 			Channels:        sineCH, // Actual source channels for sine wave
-			BitDepth:        16,    // Generating S16LE
+			BitDepth:        16,     // Generating S16LE
 			IsFloat:         false,
 			FramesPerBuffer: uint32(float64(sineSR) * 0.020), // 20ms worth of frames
-			Codec:           codecForSine, // Codec for the WebRTC track
+			Codec:           codecForSine,                    // Codec for the WebRTC track
 		}
 		audioChan = startSineWaveGenerator(currentCaptureConfig) // Generator uses currentCaptureConfig.SampleRate, .Channels, .FramesPerBuffer
 		log.Printf("Sine wave generator configured. Effective Track Config: %+v", *currentCaptureConfig)
+	}
+
+	// Initialize Opus encoder if Opus is the preferred codec
+	if currentCaptureConfig.Codec.MimeType == webrtc.MimeTypeOpus {
+		var errOpusEncoder error
+		opusEncoder, errOpusEncoder = opus.NewEncoder(
+			int(currentCaptureConfig.Codec.ClockRate), // Should be 48000 for Opus
+			int(currentCaptureConfig.Codec.Channels),  // Should be 2 for Opus
+			opus.AppVoIP,
+		)
+		if errOpusEncoder != nil {
+			log.Fatalf("Failed to create Opus encoder: %v", errOpusEncoder)
+		}
+		log.Printf("Opus encoder initialized: SR=%d, CH=%d, App=VoIP",
+			currentCaptureConfig.Codec.ClockRate,
+			currentCaptureConfig.Codec.Channels)
+
+		// Configure Opus encoder based on appConfig
+		if appConfig.OpusMaxAverageBitrate > 0 {
+			if err := opusEncoder.SetBitrate(appConfig.OpusMaxAverageBitrate); err != nil {
+				log.Printf("Warning: Failed to set Opus encoder bitrate (from opus-maxaveragebitrate %d): %v", appConfig.OpusMaxAverageBitrate, err)
+			} else {
+				log.Printf("Opus encoder bitrate (from opus-maxaveragebitrate) set to %d bps", appConfig.OpusMaxAverageBitrate)
+			}
+		} else if appConfig.AudioBitrate > 0 { // Fallback to general audio-bitrate
+			if err := opusEncoder.SetBitrate(appConfig.AudioBitrate); err != nil {
+				log.Printf("Warning: Failed to set Opus encoder bitrate (from audio-bitrate %d): %v", appConfig.AudioBitrate, err)
+			} else {
+				log.Printf("Opus encoder bitrate (from audio-bitrate) set to %d bps", appConfig.AudioBitrate)
+			}
+		}
+
+		if err := opusEncoder.SetVariableBitrate(!appConfig.OpusCBR); err != nil { // VBR is !CBR
+			log.Printf("Warning: Failed to set Opus encoder VBR/CBR state (CBR: %t): %v", appConfig.OpusCBR, err)
+		} else {
+			log.Printf("Opus encoder VBR mode: %t (CBR: %t)", !appConfig.OpusCBR, appConfig.OpusCBR)
+		}
+
+		if err := opusEncoder.SetInbandFec(appConfig.OpusUseInbandFEC); err != nil {
+			log.Printf("Warning: Failed to set Opus encoder Inband FEC (%t): %v", appConfig.OpusUseInbandFEC, err)
+		} else {
+			log.Printf("Opus encoder Inband FEC: %t", appConfig.OpusUseInbandFEC)
+		}
+
+		if err := opusEncoder.SetDtx(appConfig.OpusUseDTX); err != nil {
+			log.Printf("Warning: Failed to set Opus encoder DTX (%t): %v", appConfig.OpusUseDTX, err)
+		} else {
+			log.Printf("Opus encoder DTX: %t", appConfig.OpusUseDTX)
+		}
 	}
 
 	trackManager := NewTrackManager(currentCaptureConfig)
 
 	// Goroutine to read audio data and write to all managed tracks
 	go func() {
+		log.Println("Audio processing goroutine started.")
+
+		// Determine the desired interval for pacing WriteSample calls
+		var processingInterval time.Duration
+		if trackManager.captureConfig != nil && trackManager.captureConfig.SampleRate > 0 && trackManager.captureConfig.FramesPerBuffer > 0 {
+			processingInterval = time.Duration(trackManager.captureConfig.FramesPerBuffer) * time.Second / time.Duration(trackManager.captureConfig.SampleRate)
+		} else {
+			processingInterval = 20 * time.Millisecond // Fallback to 20ms
+			log.Printf("Audio processing goroutine: captureConfig not fully available for interval calculation, defaulting to %v", processingInterval)
+		}
+		log.Printf("Audio processing goroutine: pacing WriteSample calls at interval: %v", processingInterval)
+
+		// processingTicker := time.NewTicker(processingInterval) // Removed for simpler data-driven pacing
+		// defer processingTicker.Stop() // Removed
+
 		for rawAudioData := range audioChan {
+			// log.Printf("Audio processing: Received %d bytes from audioChan", len(rawAudioData)) // Checked
 			if rawAudioData == nil {
 				log.Println("Audio channel closed, stopping audio write goroutine.")
 				return
@@ -328,7 +386,7 @@ func main() {
 				log.Printf("Warning: Unsupported source audio format (float:%t, depth:%d). Cannot calculate frames. Skipping.", sourceIsFloat, sourceBitDepth)
 				continue
 			}
-			
+
 			// Total bytes for one frame across all source channels
 			bytesPerSourceFrame := bytesPerSourceSampleValue * sourceChannels
 			if bytesPerSourceFrame == 0 { // Should be caught by sourceChannels == 0 earlier, but defensive
@@ -359,13 +417,19 @@ func main() {
 			if sourceIsFloat && sourceBitDepth == 32 && isTargetS16LE {
 				// Source is float32, target is S16LE. Convert.
 				// numTotalSourceSampleValues is total sample points (e.g. L,R,L,R for stereo float if sourceChannels=2)
-				numTotalSourceSampleValues := len(rawAudioData) / 4 // 4 bytes per float32 sample value
+				numTotalSourceSampleValues := len(rawAudioData) / 4        // 4 bytes per float32 sample value
 				s16leSamples := make([]byte, numTotalSourceSampleValues*2) // 2 bytes per int16 sample value
 				for i := 0; i < numTotalSourceSampleValues; i++ {
 					floatSample := math.Float32frombits(binary.LittleEndian.Uint32(rawAudioData[i*4 : (i+1)*4]))
 					scaledSample := float64(floatSample) * 32767.0
 					var intSample int16
-					if scaledSample > 32767.0 { intSample = 32767 } else if scaledSample < -32768.0 { intSample = -32768 } else { intSample = int16(scaledSample) }
+					if scaledSample > 32767.0 {
+						intSample = 32767
+					} else if scaledSample < -32768.0 {
+						intSample = -32768
+					} else {
+						intSample = int16(scaledSample)
+					}
 					binary.LittleEndian.PutUint16(s16leSamples[i*2:(i+1)*2], uint16(intSample))
 				}
 				processedPacket = s16leSamples // Now S16LE, channel count is still `sourceChannels`
@@ -387,7 +451,7 @@ func main() {
 				// At this point, processedPacket is S16LE mono if conversions happened correctly.
 				// numFramesForDurationCalc is the number of mono frames from the source.
 				numMonoFrames := numFramesForDurationCalc
-				
+
 				// Validate that processedPacket actually contains S16LE mono data of expected length.
 				expectedMonoS16LELength := numMonoFrames * 2 // 2 bytes per S16LE sample
 				if len(processedPacket) != expectedMonoS16LELength {
@@ -408,7 +472,7 @@ func main() {
 				}
 				processedPacket = stereoPacket // Now S16LE stereo
 			}
-			
+
 			// --- Calculate dynamic sample duration using frames from SOURCE data ---
 			var dynamicSampleDuration time.Duration
 			if numFramesForDurationCalc > 0 {
@@ -424,8 +488,54 @@ func main() {
 					dynamicSampleDuration, numFramesForDurationCalc, sourceSampleRate)
 				continue
 			}
+			// log.Printf("Audio processing: Processed packet length: %d, Duration: %v. Source SR: %d, CH: %d. Target Codec: %s, CH: %d",
+			// 	len(processedPacket), dynamicSampleDuration, sourceSampleRate, sourceChannels, currentCaptureConfig.Codec.MimeType, targetCodecChannels)
 
-			trackManager.WriteSampleToAllTracks(media.Sample{Data: processedPacket, Duration: dynamicSampleDuration})
+			// log.Printf("Audio Processing: rawDataLen=%d, srcSR=%d, srcCH=%d, srcDepth=%d, srcFloat=%t, bytesPerSrcFrame=%d, numFramesForDuration=%d",
+			// 	len(rawAudioData), sourceSampleRate, sourceChannels, sourceBitDepth, sourceIsFloat, bytesPerSourceFrame, numFramesForDurationCalc)
+			// log.Printf("Audio Processing: targetCodecMime=%s, targetCH=%d, isTargetS16LE=%t",
+			// 	currentCaptureConfig.Codec.MimeType, targetCodecChannels, isTargetS16LE)
+			// if isTargetS16LE && targetCodecChannels == 2 && sourceChannels == 1 {
+			// 	log.Printf("Audio Processing: Mono-to-Stereo conversion was performed.")
+			// }
+			// log.Printf("Audio Processing: processedPacketLen=%d, dynamicSampleDuration=%s",
+			// 	len(processedPacket), dynamicSampleDuration.String())
+
+			encodedPacketData := processedPacket // Default to PCM data
+
+			if currentCaptureConfig.Codec.MimeType == webrtc.MimeTypeOpus && opusEncoder != nil {
+				// Convert S16LE []byte to []int16 for Opus encoder
+				if len(processedPacket)%2 != 0 {
+					log.Printf("Error: processedPacket length %d is not even for S16LE to []int16 conversion. Skipping Opus encoding.", len(processedPacket))
+				} else {
+					numPCM16Samples := len(processedPacket) / 2
+					pcm16 := make([]int16, numPCM16Samples)
+					for i := 0; i < numPCM16Samples; i++ {
+						pcm16[i] = int16(binary.LittleEndian.Uint16(processedPacket[i*2 : (i+1)*2]))
+					}
+
+					// Prepare buffer for Opus encoded data.
+					// A common Opus frame is 20ms. At 48kHz stereo, this is 960 samples/channel.
+					// Max bitrate for Opus is high, but typical frame sizes are small.
+					// A buffer of 4000 bytes should be sufficient for most Opus frames.
+					opusDataBuffer := make([]byte, 4000)
+
+					n, err := opusEncoder.Encode(pcm16, opusDataBuffer)
+					if err != nil {
+						log.Printf("Opus encoding failed: %v. Sending raw PCM instead.", err)
+						// encodedPacketData remains processedPacket (PCM)
+					} else {
+						encodedPacketData = opusDataBuffer[:n]
+						// log.Printf("Opus encoded %d PCM bytes to %d Opus bytes. Duration: %v", len(processedPacket), n, dynamicSampleDuration)
+					}
+				}
+			}
+
+			trackManager.WriteSampleToAllTracks(media.Sample{Data: encodedPacketData, Duration: dynamicSampleDuration})
+			// log.Printf("DEBUG: Wrote sample to track manager. Packet size: %d, Duration: %v", len(encodedPacketData), dynamicSampleDuration) // Example debug line
+
+			// Wait for the next tick to pace the WriteSample calls -- Removed processingTicker
+			// <-processingTicker.C
 		}
 		log.Println("Exited audio track writing loop.")
 	}()
@@ -447,7 +557,6 @@ func main() {
 	fs := http.FileServer(http.Dir(clientDirPath))
 	http.Handle("/", fs)
 	log.Printf("Serving static files from %s at /", clientDirPath)
-
 
 	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("Received /offer request")
@@ -496,7 +605,7 @@ func main() {
 					// Track removal from manager will be handled by OnConnectionStateChange or WriteSample error
 					return
 				} else if len(pkts) > 0 {
-					// log.Printf("Received %d RTCP packets for track %s", len(pkts), trackID)
+					log.Printf("Received %d RTCP packets for track %s", len(pkts), trackID)
 					// Process RTCP packets if necessary (e.g., Sender Reports, Receiver Reports)
 				}
 			}
@@ -511,7 +620,7 @@ func main() {
 				return
 			}
 			// Normally, these would be sent to the client via the signaling channel.
-			// log.Printf("ICE Candidate for PC of track %s: %s", trackID, candidate.ToJSON().Candidate)
+			log.Printf("ICE Candidate for PC of track %s: %s", trackID, candidate.ToJSON().Candidate)
 		})
 
 		peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
@@ -529,8 +638,7 @@ func main() {
 			return
 		}
 		log.Printf("Offer received for track %s", trackID)
-		// log.Printf("Offer SDP:\n%s", offer.SDP)
-
+		log.Printf("Offer SDP for track %s:\n%s", trackID, offer.SDP)
 
 		if err := peerConnection.SetRemoteDescription(offer); err != nil {
 			log.Printf("Failed to set remote description for track %s: %v", trackID, err)
@@ -546,8 +654,7 @@ func main() {
 			return
 		}
 		log.Printf("Raw Answer created for track %s", trackID)
-		// log.Printf("Initial Answer SDP:\n%s", answer.SDP)
-
+		log.Printf("Initial Answer SDP for track %s (before SetLocalDescription):\n%s", trackID, answer.SDP)
 
 		// SDP modification was removed. Using answer from CreateAnswer directly.
 		// log.Printf("Original Answer SDP before SetLocalDescription:\n%s", answer.SDP)
@@ -558,14 +665,14 @@ func main() {
 			http.Error(w, "Failed to set local description", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("Local description set for track %s (with modified SDP). Waiting for ICE gathering...", trackID)
-		// log.Printf("Modified Answer SDP set as local:\n%s", answer.SDP)
-
+		log.Printf("Local description set for track %s. Waiting for ICE gathering...", trackID)
 
 		<-gatherComplete
 		log.Printf("ICE Gathering Complete for track %s.", trackID)
 
-		response, err := json.Marshal(*peerConnection.LocalDescription())
+		finalLocalDescription := *peerConnection.LocalDescription()
+		log.Printf("Final Local Description SDP for track %s (to be sent to client):\n%s", trackID, finalLocalDescription.SDP)
+		response, err := json.Marshal(finalLocalDescription)
 		if err != nil {
 			log.Printf("Failed to marshal final local description for track %s: %v", trackID, err)
 			http.Error(w, "Failed to marshal answer", http.StatusInternalServerError)
@@ -582,7 +689,7 @@ func main() {
 	// Graceful shutdown handling
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	serverAddr := ":" + appConfig.Port
 	httpServer := &http.Server{Addr: serverAddr}
 
@@ -602,7 +709,6 @@ func main() {
 			log.Println("Sine wave generator will stop as its channel reader terminates.")
 		}
 
-
 		trackManager.mu.Lock()
 		log.Printf("Closing all %d managed tracks...", len(trackManager.tracks))
 		for id := range trackManager.tracks {
@@ -611,12 +717,12 @@ func main() {
 			// or errors in WriteSample will lead to their removal from the manager.
 			log.Printf("Track %s will be implicitly closed/removed.", id)
 		}
-		trackManager.tracks = make(map[string]*webrtc.TrackLocalStaticSample) 
+		trackManager.tracks = make(map[string]*webrtc.TrackLocalStaticSample)
 		trackManager.mu.Unlock()
 		log.Println("Track manager cleared.")
 
 		log.Printf("Shutting down HTTP server at %s...", serverAddr)
-		if err := httpServer.Shutdown(nil); err != nil { 
+		if err := httpServer.Shutdown(nil); err != nil {
 			log.Printf("HTTP server Shutdown: %v", err)
 		}
 		log.Println("Shutdown sequence complete.")
