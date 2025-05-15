@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -80,15 +81,8 @@ func (tm *TrackManager) WriteSampleToAllTracks(sample media.Sample) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if len(tm.tracks) == 0 {
-		// log.Println("TrackManager.WriteSampleToAllTracks: No tracks to write to.") // Can be verbose
-		return
-	}
-	// log.Printf("TrackManager.WriteSampleToAllTracks: Writing sample (len: %d, dur: %v) to %d tracks", len(sample.Data), sample.Duration, len(tm.tracks))
-
 	tracksToRemove := []string{}
 	for id, track := range tm.tracks {
-		log.Printf("TrackManager.WriteSampleToAllTracks: Attempting to write to track %s (Sample len: %d, dur: %v)", id, len(sample.Data), sample.Duration)
 		if err := track.WriteSample(sample); err != nil {
 			// media.ErrClosedPipe might not be exported or could have changed.
 			// The string checks are more robust for identifying closed pipe scenarios.
@@ -101,8 +95,6 @@ func (tm *TrackManager) WriteSampleToAllTracks(sample media.Sample) {
 			} else {
 				log.Printf("Error writing sample to track %s: %v", id, err)
 			}
-		} else {
-			log.Printf("TrackManager.WriteSampleToAllTracks: Successfully wrote to track %s", id)
 		}
 	}
 
@@ -135,10 +127,11 @@ func getCodecCapability(codecName string, sourceSampleRate uint32, sourceChannel
 		if cliCfg.OpusCBR { // Default false in AppConfig
 			opusFmtpParams = append(opusFmtpParams, "cbr=1")
 		}
-		if cliCfg.SineWave {
+		// Configure usedtx based on the OpusUseDTX flag, not SineWave presence
+		if cliCfg.OpusUseDTX {
 			opusFmtpParams = append(opusFmtpParams, "usedtx=1")
 		} else {
-			opusFmtpParams = append(opusFmtpParams, "usedtx=0") // Explicitly disable DTX
+			opusFmtpParams = append(opusFmtpParams, "usedtx=0")
 		}
 
 		if sourceChannels == 2 {
@@ -191,37 +184,33 @@ func startSineWaveGenerator(config *AudioCaptureConfig) <-chan []byte {
 		ticker := time.NewTicker(bufferDuration)
 		defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				numSamplesPerChannel := int(config.FramesPerBuffer)
-				totalSamples := numSamplesPerChannel * int(config.Channels)
-				pcmData := make([]int16, totalSamples)
-
-				for i := 0; i < numSamplesPerChannel; i++ {
-					t := timeOffset + float64(i)*timeIncrementPerSample
-					sampleValue := amplitude * math.Sin(2*math.Pi*frequency*t)
-					for ch := 0; ch < int(config.Channels); ch++ {
-						pcmData[i*int(config.Channels)+ch] = int16(sampleValue)
-					}
+		for range ticker.C {
+			numSamplesPerChannel := int(config.FramesPerBuffer)
+			totalSamples := numSamplesPerChannel * int(config.Channels)
+			pcmData := make([]int16, totalSamples)
+			for i := 0; i < numSamplesPerChannel; i++ {
+				t := timeOffset + float64(i)*timeIncrementPerSample
+				sampleValue := amplitude * math.Sin(2*math.Pi*frequency*t)
+				for ch := 0; ch < int(config.Channels); ch++ {
+					pcmData[i*int(config.Channels)+ch] = int16(sampleValue)
 				}
-				timeOffset += float64(numSamplesPerChannel) * timeIncrementPerSample
-
-				byteData := make([]byte, totalSamples*2) // 2 bytes per int16
-				for i, s := range pcmData {
-					binary.LittleEndian.PutUint16(byteData[i*2:], uint16(s))
-				}
-
-				select {
-				case audioChan <- byteData:
-					// log.Printf("Sine wave generator: Sent %d bytes to audioChan", len(byteData)) // Can be very verbose
-				default:
-					log.Println("Sine wave audio channel full, discarding packet.")
-				}
-				// TODO: Add a way to stop this goroutine cleanly, e.g., via a quit channel.
-				// For now, it stops when audioChan's reader (main audio processing goroutine) stops.
-				// Or if DefaultAudioCapture.Stop() is adapted to signal this too for shutdown.
 			}
+			timeOffset += float64(numSamplesPerChannel) * timeIncrementPerSample
+
+			byteData := make([]byte, totalSamples*2) // 2 bytes per int16
+			for i, s := range pcmData {
+				binary.LittleEndian.PutUint16(byteData[i*2:], uint16(s))
+			}
+
+			select {
+			case audioChan <- byteData:
+				// log.Printf("Sine wave generator: Sent %d bytes to audioChan", len(byteData)) // Can be very verbose
+			default:
+				log.Println("Sine wave audio channel full, discarding packet.")
+			}
+			// TODO: Add a way to stop this goroutine cleanly, e.g., via a quit channel.
+			// For now, it stops when audioChan's reader (main audio processing goroutine) stops.
+			// Or if DefaultAudioCapture.Stop() is adapted to signal this too for shutdown.
 		}
 	}()
 	log.Println("Sine wave generator started.")
@@ -354,188 +343,228 @@ func main() {
 
 		// processingTicker := time.NewTicker(processingInterval) // Removed for simpler data-driven pacing
 		// defer processingTicker.Stop() // Removed
+		var audioAccumulator []byte
+		opusFrameDuration := 20 * time.Millisecond // Target Opus frame duration, common and safe
+
+		var opusEncoderSampleRate int // Declare at higher scope
+		var opusEncoderChannels int   // Declare at higher scope
 
 		for rawAudioData := range audioChan {
-			// log.Printf("Audio processing: Received %d bytes from audioChan", len(rawAudioData)) // Checked
 			if rawAudioData == nil {
 				log.Println("Audio channel closed, stopping audio write goroutine.")
 				return
 			}
+			audioAccumulator = append(audioAccumulator, rawAudioData...)
+			// log.Printf("Audio processing: Received %d bytes, accumulator now %d bytes", len(rawAudioData), len(audioAccumulator))
 
-			processedPacket := rawAudioData // Start with raw data
-
-			// Determine properties of the source audio from currentCaptureConfig
+			// Determine properties of the SOURCE audio (from WASAPI)
 			sourceIsFloat := currentCaptureConfig.IsFloat
 			sourceBitDepth := currentCaptureConfig.BitDepth
-			sourceChannels := int(currentCaptureConfig.Channels)
-			sourceSampleRate := currentCaptureConfig.SampleRate
+			sourceChannels := int(currentCaptureConfig.Channels) // Actual channels from WASAPI
+			sourceSampleRate := currentCaptureConfig.SampleRate  // Actual sample rate from WASAPI
 
 			if sourceChannels == 0 || sourceSampleRate == 0 {
-				log.Printf("Error critical: Source channels (%d) or sample rate (%d) is zero. Skipping packet.", sourceChannels, sourceSampleRate)
+				log.Printf("Error critical: Source channels (%d) or sample rate (%d) is zero from capture config. Clearing accumulator.", sourceChannels, sourceSampleRate)
+				audioAccumulator = []byte{} // Clear accumulator on bad config
 				continue
 			}
 
-			// --- Calculate number of frames from source for duration ---
-			var numFramesForDurationCalc int
-			bytesPerSourceSampleValue := 0 // Bytes for a single sample value (e.g., float32 is 4, int16 is 2)
+			// Determine bytes per single sample value for source format (e.g., float32 is 4, int16 is 2)
+			bytesPerSourceSampleValue := 0
 			if sourceIsFloat && sourceBitDepth == 32 {
 				bytesPerSourceSampleValue = 4
 			} else if !sourceIsFloat && sourceBitDepth == 16 {
 				bytesPerSourceSampleValue = 2
 			} else {
-				log.Printf("Warning: Unsupported source audio format (float:%t, depth:%d). Cannot calculate frames. Skipping.", sourceIsFloat, sourceBitDepth)
+				log.Printf("Warning: Unsupported source audio format (float:%t, depth:%d). Clearing accumulator.", sourceIsFloat, sourceBitDepth)
+				audioAccumulator = []byte{}
 				continue
 			}
+			// Bytes for one multi-channel frame from source (e.g., S16LE stereo: 2*2=4 bytes; F32 stereo: 4*2=8 bytes)
+			sourceBytesPerFullFrame := bytesPerSourceSampleValue * sourceChannels
 
-			// Total bytes for one frame across all source channels
-			bytesPerSourceFrame := bytesPerSourceSampleValue * sourceChannels
-			if bytesPerSourceFrame == 0 { // Should be caught by sourceChannels == 0 earlier, but defensive
-				log.Printf("Error: Calculated bytesPerSourceFrame is zero. Skipping.")
-				continue
-			}
-			if len(rawAudioData)%bytesPerSourceFrame != 0 {
-				log.Printf("Error: rawAudioData length (%d) is not a multiple of expected source frame size (%d bytes/frame). Skipping.", len(rawAudioData), bytesPerSourceFrame)
-				continue
-			}
-			numFramesForDurationCalc = len(rawAudioData) / bytesPerSourceFrame
-			if numFramesForDurationCalc == 0 {
-				// log.Println("Received empty audio data based on frame calculation. Skipping.")
-				continue
-			}
+			isOpusCodec := currentCaptureConfig.Codec.MimeType == webrtc.MimeTypeOpus && opusEncoder != nil
+			targetCodecChannels := int(currentCaptureConfig.Codec.Channels) // Channels expected by the WebRTC track codec (e.g., 2 for Opus)
 
-			// --- Determine if target track codec expects S16LE ---
-			isTargetS16LE := false
-			targetCodecChannels := int(currentCaptureConfig.Codec.Channels)
-			switch currentCaptureConfig.Codec.MimeType {
-			case webrtc.MimeTypeOpus, webrtc.MimeTypeG722, webrtc.MimeTypePCMA, webrtc.MimeTypePCMU:
-				isTargetS16LE = true
-			case "": // Default or unspecified for raw audio tracks might imply S16LE
-				isTargetS16LE = true
-			}
+			var bytesToTakeFromAccumulatorPerIteration int
+			var iterationFrameDuration time.Duration
 
-			// --- Convert source audio to S16LE if necessary ---
-			if sourceIsFloat && sourceBitDepth == 32 && isTargetS16LE {
-				// Source is float32, target is S16LE. Convert.
-				// numTotalSourceSampleValues is total sample points (e.g. L,R,L,R for stereo float if sourceChannels=2)
-				numTotalSourceSampleValues := len(rawAudioData) / 4        // 4 bytes per float32 sample value
-				s16leSamples := make([]byte, numTotalSourceSampleValues*2) // 2 bytes per int16 sample value
-				for i := 0; i < numTotalSourceSampleValues; i++ {
-					floatSample := math.Float32frombits(binary.LittleEndian.Uint32(rawAudioData[i*4 : (i+1)*4]))
-					scaledSample := float64(floatSample) * 32767.0
-					var intSample int16
-					if scaledSample > 32767.0 {
-						intSample = 32767
-					} else if scaledSample < -32768.0 {
-						intSample = -32768
-					} else {
-						intSample = int16(scaledSample)
-					}
-					binary.LittleEndian.PutUint16(s16leSamples[i*2:(i+1)*2], uint16(intSample))
+			if isOpusCodec {
+				// Opus encoder parameters
+				opusEncoderSampleRate = int(currentCaptureConfig.Codec.ClockRate) // Assign to higher scope variable
+				opusEncoderChannels = int(targetCodecChannels)                    // Assign to higher scope variable
+
+				// Samples per channel for one Opus frame at the ENCODER'S sample rate
+				opusPcmSamplesPerChannel := int(float64(opusEncoderSampleRate) * opusFrameDuration.Seconds())
+
+				// We need to figure out how many bytes of SOURCE audio correspond to `opusPcmSamplesPerChannel` at SOURCE rate
+				// This assumes sourceSampleRate will be resampled to opusEncoderSampleRate if different.
+				// For now, we assume sourceSampleRate == opusEncoderSampleRate for simplicity, as no resampler is present.
+				// If they are different, this logic will be flawed without resampling.
+				// The number of source frames needed is `opusPcmSamplesPerChannel`.
+				if sourceSampleRate != uint32(opusEncoderSampleRate) {
+					// This is a critical point: if sample rates differ, resampling is needed.
+					// The current code doesn't resample. We'll proceed assuming they match for now,
+					// as the problem description (768 vs 3840 bytes) suggests rate match but varying chunk size.
+					log.Printf("Warning: Source SR (%d) != Opus Encoder SR (%d). Resampling not implemented. Audio quality/timing issues may occur.", sourceSampleRate, opusEncoderSampleRate)
 				}
-				processedPacket = s16leSamples // Now S16LE, channel count is still `sourceChannels`
-			} else if !sourceIsFloat && sourceBitDepth == 16 && isTargetS16LE {
-				// Source is already S16LE, target is S16LE. No conversion needed for sample format.
-				// processedPacket remains rawAudioData
-			} else if !isTargetS16LE {
-				log.Printf("Warning: Target codec %s does not expect S16LE. Source (float:%t, depth:%d). Passing raw data.",
-					currentCaptureConfig.Codec.MimeType, sourceIsFloat, sourceBitDepth)
-				// processedPacket remains rawAudioData. This path might be problematic if codec expects something else.
+
+				// Bytes of source audio needed to produce one Opus frame's worth of samples
+				// (assuming sourceSampleRate is what Opus encoder will effectively receive after potential resampling)
+				bytesToTakeFromAccumulatorPerIteration = opusPcmSamplesPerChannel * sourceChannels * bytesPerSourceSampleValue
+				iterationFrameDuration = opusFrameDuration
 			} else {
-				// Source is not float32 or S16LE, but target is S16LE. Unhandled source format.
-				log.Printf("Warning: Unhandled source format (float:%t, depth:%d) for S16LE target. Passing raw data.", sourceIsFloat, sourceBitDepth)
-				// processedPacket remains rawAudioData
+				// For non-Opus codecs, process in chunks of roughly 20ms based on source format, or just what's available if small
+				// This part can be refined. For now, let's try to frame non-Opus to 20ms as well.
+				if sourceBytesPerFullFrame > 0 {
+					desiredFramesPerChunk := int(float64(sourceSampleRate) * (20 * time.Millisecond).Seconds())
+					bytesToTakeFromAccumulatorPerIteration = desiredFramesPerChunk * sourceBytesPerFullFrame
+					iterationFrameDuration = 20 * time.Millisecond
+
+					if len(audioAccumulator) < bytesToTakeFromAccumulatorPerIteration && len(audioAccumulator) > 0 && len(audioAccumulator)%sourceBytesPerFullFrame == 0 {
+						// If less than 20ms but still valid frames, process what's there
+						bytesToTakeFromAccumulatorPerIteration = len(audioAccumulator)
+						iterationFrameDuration = time.Duration(len(audioAccumulator)/sourceBytesPerFullFrame) * time.Second / time.Duration(sourceSampleRate)
+					} else if len(audioAccumulator) < bytesToTakeFromAccumulatorPerIteration {
+						// Not enough for a full preferred chunk, and not a clean partial chunk, so wait for more.
+						continue
+					}
+
+				} else { // Should not happen if sourceChannels > 0 and bytesPerSourceSampleValue > 0
+					log.Println("Error: sourceBytesPerFullFrame is zero for non-Opus. Clearing accumulator.")
+					audioAccumulator = []byte{}
+					continue
+				}
 			}
 
-			// --- Mono to Stereo conversion if track expects stereo but processedPacket (now S16LE) is mono ---
-			if isTargetS16LE && targetCodecChannels == 2 && sourceChannels == 1 {
-				// At this point, processedPacket is S16LE mono if conversions happened correctly.
-				// numFramesForDurationCalc is the number of mono frames from the source.
-				numMonoFrames := numFramesForDurationCalc
+			if bytesToTakeFromAccumulatorPerIteration <= 0 {
+				// log.Printf("Calculated bytesToTakeFromAccumulatorPerIteration is %d, skipping processing this cycle.", bytesToTakeFromAccumulatorPerIteration)
+				continue // Avoid issues if calculation results in zero or negative
+			}
 
-				// Validate that processedPacket actually contains S16LE mono data of expected length.
-				expectedMonoS16LELength := numMonoFrames * 2 // 2 bytes per S16LE sample
-				if len(processedPacket) != expectedMonoS16LELength {
-					log.Printf("Error: Mismatch in S16LE mono packet size for mono-to-stereo conversion. Expected %d bytes for %d frames, got %d bytes. Skipping.",
-						expectedMonoS16LELength, numMonoFrames, len(processedPacket))
+			// Inner loop to process fixed-size chunks from accumulator
+			for len(audioAccumulator) >= bytesToTakeFromAccumulatorPerIteration {
+				chunkFromAccumulator := make([]byte, bytesToTakeFromAccumulatorPerIteration)
+				copy(chunkFromAccumulator, audioAccumulator[:bytesToTakeFromAccumulatorPerIteration])
+				audioAccumulator = audioAccumulator[bytesToTakeFromAccumulatorPerIteration:]
+
+				// `chunkFromAccumulator` is in source format (sourceChannels, sourceBitDepth, sourceIsFloat)
+				// It represents `iterationFrameDuration` of audio at `sourceSampleRate`.
+
+				processedPacket := chunkFromAccumulator // Start with the chunk from accumulator
+
+				// --- Calculate number of frames IN THIS CHUNK for format conversions ---
+				// This chunk `chunkFromAccumulator` is still in source format.
+				numFramesInChunk := 0
+				if sourceBytesPerFullFrame > 0 && len(chunkFromAccumulator)%sourceBytesPerFullFrame == 0 {
+					numFramesInChunk = len(chunkFromAccumulator) / sourceBytesPerFullFrame
+				} else {
+					log.Printf("Error: chunkFromAccumulator length (%d) is not multiple of source frame size (%d). Skipping chunk.", len(chunkFromAccumulator), sourceBytesPerFullFrame)
+					continue
+				}
+				if numFramesInChunk == 0 { // Should not happen if bytesToTakeFromAccumulatorPerIteration > 0
 					continue
 				}
 
-				stereoPacket := make([]byte, numMonoFrames*2*2) // Each mono frame (2 bytes) becomes a 2-channel stereo frame (4 bytes)
-				for i := 0; i < numMonoFrames; i++ {
-					monoSampleBytes := processedPacket[i*2 : (i+1)*2]
-					// Left channel
-					stereoPacket[i*4] = monoSampleBytes[0]
-					stereoPacket[i*4+1] = monoSampleBytes[1]
-					// Right channel (duplicate mono sample)
-					stereoPacket[i*4+2] = monoSampleBytes[0]
-					stereoPacket[i*4+3] = monoSampleBytes[1]
+				// --- Determine if target track codec expects S16LE ---
+				isTargetS16LE := false
+				// targetCodecChannels is already defined (e.g., 2 for Opus track)
+				switch currentCaptureConfig.Codec.MimeType {
+				case webrtc.MimeTypeOpus, webrtc.MimeTypeG722, webrtc.MimeTypePCMA, webrtc.MimeTypePCMU:
+					isTargetS16LE = true
+				case "":
+					isTargetS16LE = true
 				}
-				processedPacket = stereoPacket // Now S16LE stereo
-			}
 
-			// --- Calculate dynamic sample duration using frames from SOURCE data ---
-			var dynamicSampleDuration time.Duration
-			if numFramesForDurationCalc > 0 {
-				dynamicSampleDuration = time.Duration(numFramesForDurationCalc) * time.Second / time.Duration(sourceSampleRate)
-			} else {
-				// This case should have been caught earlier by numFramesForDurationCalc == 0 check
-				log.Println("Warning: numFramesForDurationCalc is zero after processing, cannot calculate duration. Skipping.")
-				continue
-			}
-
-			if dynamicSampleDuration <= 0 {
-				log.Printf("Warning: Calculated dynamicSampleDuration is zero or negative (%v). Frames: %d, SR: %d. Skipping.",
-					dynamicSampleDuration, numFramesForDurationCalc, sourceSampleRate)
-				continue
-			}
-			// log.Printf("Audio processing: Processed packet length: %d, Duration: %v. Source SR: %d, CH: %d. Target Codec: %s, CH: %d",
-			// 	len(processedPacket), dynamicSampleDuration, sourceSampleRate, sourceChannels, currentCaptureConfig.Codec.MimeType, targetCodecChannels)
-
-			// log.Printf("Audio Processing: rawDataLen=%d, srcSR=%d, srcCH=%d, srcDepth=%d, srcFloat=%t, bytesPerSrcFrame=%d, numFramesForDuration=%d",
-			// 	len(rawAudioData), sourceSampleRate, sourceChannels, sourceBitDepth, sourceIsFloat, bytesPerSourceFrame, numFramesForDurationCalc)
-			// log.Printf("Audio Processing: targetCodecMime=%s, targetCH=%d, isTargetS16LE=%t",
-			// 	currentCaptureConfig.Codec.MimeType, targetCodecChannels, isTargetS16LE)
-			// if isTargetS16LE && targetCodecChannels == 2 && sourceChannels == 1 {
-			// 	log.Printf("Audio Processing: Mono-to-Stereo conversion was performed.")
-			// }
-			// log.Printf("Audio Processing: processedPacketLen=%d, dynamicSampleDuration=%s",
-			// 	len(processedPacket), dynamicSampleDuration.String())
-
-			encodedPacketData := processedPacket // Default to PCM data
-
-			if currentCaptureConfig.Codec.MimeType == webrtc.MimeTypeOpus && opusEncoder != nil {
-				// Convert S16LE []byte to []int16 for Opus encoder
-				if len(processedPacket)%2 != 0 {
-					log.Printf("Error: processedPacket length %d is not even for S16LE to []int16 conversion. Skipping Opus encoding.", len(processedPacket))
+				// --- Convert source audio (in chunkFromAccumulator) to S16LE if necessary ---
+				if sourceIsFloat && sourceBitDepth == 32 && isTargetS16LE {
+					numTotalSourceSampleValues := len(chunkFromAccumulator) / 4
+					s16leSamples := make([]byte, numTotalSourceSampleValues*2)
+					for i := 0; i < numTotalSourceSampleValues; i++ {
+						floatSample := math.Float32frombits(binary.LittleEndian.Uint32(chunkFromAccumulator[i*4 : (i+1)*4]))
+						scaledSample := float64(floatSample) * 32767.0
+						var intSample int16
+						if scaledSample > 32767.0 {
+							intSample = 32767
+						} else if scaledSample < -32768.0 {
+							intSample = -32768
+						} else {
+							intSample = int16(scaledSample)
+						}
+						binary.LittleEndian.PutUint16(s16leSamples[i*2:(i+1)*2], uint16(intSample))
+					}
+					processedPacket = s16leSamples // Now S16LE, channel count is still `sourceChannels`
+				} else if !sourceIsFloat && sourceBitDepth == 16 && isTargetS16LE {
+					// processedPacket remains chunkFromAccumulator (already S16LE)
+				} else if !isTargetS16LE {
+					log.Printf("Warning: Target codec %s does not expect S16LE. Source (float:%t, depth:%d). Passing raw data.", currentCaptureConfig.Codec.MimeType, sourceIsFloat, sourceBitDepth)
 				} else {
-					numPCM16Samples := len(processedPacket) / 2
-					pcm16 := make([]int16, numPCM16Samples)
-					for i := 0; i < numPCM16Samples; i++ {
+					log.Printf("Warning: Unhandled source format (float:%t, depth:%d) for S16LE target. Passing raw data.", sourceIsFloat, sourceBitDepth)
+				}
+				// At this point, `processedPacket` is S16LE if target is S16LE, otherwise it's original. It has `sourceChannels`.
+
+				// --- Mono to Stereo conversion if track expects stereo but processedPacket (now S16LE) is mono ---
+				if isTargetS16LE && targetCodecChannels == 2 && sourceChannels == 1 {
+					// `processedPacket` is S16LE mono. `numFramesInChunk` is number of mono frames.
+					expectedMonoS16LELength := numFramesInChunk * 2 // 2 bytes per S16LE mono sample
+					if len(processedPacket) != expectedMonoS16LELength {
+						log.Printf("Error: Mismatch in S16LE mono packet size for mono-to-stereo conversion. Expected %d, got %d. Skipping.", expectedMonoS16LELength, len(processedPacket))
+						continue
+					}
+					stereoPacket := make([]byte, numFramesInChunk*2*2) // Each mono frame (2 bytes) becomes stereo (4 bytes)
+					for i := 0; i < numFramesInChunk; i++ {
+						monoSampleBytes := processedPacket[i*2 : (i+1)*2]
+						stereoPacket[i*4], stereoPacket[i*4+1] = monoSampleBytes[0], monoSampleBytes[1]   // Left
+						stereoPacket[i*4+2], stereoPacket[i*4+3] = monoSampleBytes[0], monoSampleBytes[1] // Right (duplicate)
+					}
+					processedPacket = stereoPacket // Now S16LE stereo
+				}
+				// Now, `processedPacket` is S16LE with `targetCodecChannels` if conversions occurred.
+
+				encodedPacketData := processedPacket
+
+				if isOpusCodec {
+					// `processedPacket` should now be S16LE, with `targetCodecChannels` (e.g., 2 for Opus)
+					// and represent `iterationFrameDuration` (e.g. 20ms) of audio at `opusEncoderSampleRate`.
+					// Number of samples per channel in `processedPacket` should be `opusPcmSamplesPerChannel`.
+					// Total samples = `opusPcmSamplesPerChannel * targetCodecChannels`.
+					// Expected length of `processedPacket` = `opusPcmSamplesPerChannel * opusEncoderChannels * 2` (bytes for S16LE).
+
+					expectedLen := (int(float64(currentCaptureConfig.Codec.ClockRate) * iterationFrameDuration.Seconds())) * opusEncoderChannels * 2
+					if len(processedPacket) != expectedLen {
+						log.Printf("Opus: Mismatch processedPacket length. Expected %d, got %d. SR_Opus: %d, Dur: %v, CH_Encoder: %d. Skipping encode.",
+							expectedLen, len(processedPacket), currentCaptureConfig.Codec.ClockRate, iterationFrameDuration, opusEncoderChannels)
+						continue
+					}
+
+					if len(processedPacket)%(opusEncoderChannels*2) != 0 && opusEncoderChannels > 0 {
+						log.Printf("Error: Opus processedPacket length %d not multiple of frame size for S16LE conv (%d). Skipping.", len(processedPacket), opusEncoderChannels*2)
+						continue
+					}
+
+					numPCM16SamplesTotal := len(processedPacket) / 2
+					pcm16 := make([]int16, numPCM16SamplesTotal)
+					for i := 0; i < numPCM16SamplesTotal; i++ {
 						pcm16[i] = int16(binary.LittleEndian.Uint16(processedPacket[i*2 : (i+1)*2]))
 					}
 
-					// Prepare buffer for Opus encoded data.
-					// A common Opus frame is 20ms. At 48kHz stereo, this is 960 samples/channel.
-					// Max bitrate for Opus is high, but typical frame sizes are small.
-					// A buffer of 4000 bytes should be sufficient for most Opus frames.
-					opusDataBuffer := make([]byte, 4000)
-
+					opusDataBuffer := make([]byte, 4000) // Max opus frame size is smaller, but this is safe
 					n, err := opusEncoder.Encode(pcm16, opusDataBuffer)
 					if err != nil {
-						log.Printf("Opus encoding failed: %v. Sending raw PCM instead.", err)
+						log.Printf("Opus encoding failed: %v. PCM len: %d. Sending raw PCM instead.", err, len(pcm16))
 						// encodedPacketData remains processedPacket (PCM)
 					} else {
 						encodedPacketData = opusDataBuffer[:n]
-						// log.Printf("Opus encoded %d PCM bytes to %d Opus bytes. Duration: %v", len(processedPacket), n, dynamicSampleDuration)
+						// log.Printf("Opus encoded %d S16LE bytes (from %d source bytes) to %d Opus bytes. Duration: %v", len(processedPacket), len(chunkFromAccumulator), n, iterationFrameDuration)
 					}
 				}
-			}
 
-			trackManager.WriteSampleToAllTracks(media.Sample{Data: encodedPacketData, Duration: dynamicSampleDuration})
-			// log.Printf("DEBUG: Wrote sample to track manager. Packet size: %d, Duration: %v", len(encodedPacketData), dynamicSampleDuration) // Example debug line
-
-			// Wait for the next tick to pace the WriteSample calls -- Removed processingTicker
-			// <-processingTicker.C
+				if iterationFrameDuration > 0 {
+					trackManager.WriteSampleToAllTracks(media.Sample{Data: encodedPacketData, Duration: iterationFrameDuration})
+				} else {
+					log.Printf("Skipping track write due to zero/negative duration. Encoded size: %d", len(encodedPacketData))
+				}
+			} // End of inner loop processing chunks from accumulator
 		}
 		log.Println("Exited audio track writing loop.")
 	}()
@@ -722,7 +751,7 @@ func main() {
 		log.Println("Track manager cleared.")
 
 		log.Printf("Shutting down HTTP server at %s...", serverAddr)
-		if err := httpServer.Shutdown(nil); err != nil {
+		if err := httpServer.Shutdown(context.TODO()); err != nil {
 			log.Printf("HTTP server Shutdown: %v", err)
 		}
 		log.Println("Shutdown sequence complete.")
