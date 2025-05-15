@@ -17,9 +17,9 @@ import (
 
 	"github.com/go-ole/go-ole" // For CoInitialize/CoUninitialize
 	"github.com/google/uuid"
+	"github.com/jj11hh/opus"
 	"github.com/pion/webrtc/v4"           // Updated to v4
 	"github.com/pion/webrtc/v4/pkg/media" // Updated to v4
-	"gopkg.in/hraban/opus.v2"
 )
 
 // AppConfig holds all command-line arguments
@@ -317,19 +317,19 @@ func main() {
 			}
 		}
 
-		if err := opusEncoder.SetVariableBitrate(!appConfig.OpusCBR); err != nil { // VBR is !CBR
+		if err := opusEncoder.SetVBR(!appConfig.OpusCBR); err != nil { // VBR is !CBR
 			log.Printf("Warning: Failed to set Opus encoder VBR/CBR state (CBR: %t): %v", appConfig.OpusCBR, err)
 		} else {
 			log.Printf("Opus encoder VBR mode: %t (CBR: %t)", !appConfig.OpusCBR, appConfig.OpusCBR)
 		}
 
-		if err := opusEncoder.SetInbandFec(appConfig.OpusUseInbandFEC); err != nil {
+		if err := opusEncoder.SetInBandFEC(appConfig.OpusUseInbandFEC); err != nil {
 			log.Printf("Warning: Failed to set Opus encoder Inband FEC (%t): %v", appConfig.OpusUseInbandFEC, err)
 		} else {
 			log.Printf("Opus encoder Inband FEC: %t", appConfig.OpusUseInbandFEC)
 		}
 
-		if err := opusEncoder.SetDtx(appConfig.OpusUseDTX); err != nil {
+		if err := opusEncoder.SetDTX(appConfig.OpusUseDTX); err != nil {
 			log.Printf("Warning: Failed to set Opus encoder DTX (%t): %v", appConfig.OpusUseDTX, err)
 		} else {
 			log.Printf("Opus encoder DTX: %t", appConfig.OpusUseDTX)
