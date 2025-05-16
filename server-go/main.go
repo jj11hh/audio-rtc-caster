@@ -552,18 +552,31 @@ func main() {
 		// This ensures encoder matches the actual audio stream characteristic.
 
 		log.Printf("Initializing Opus encoder with ClockRate: %d, Channels: %d", currentCaptureConfig.Codec.ClockRate, opusEncoderChannels)
+		app := opus.AppAudio
 		var errOpusEncoder error
 		opusEncoder, errOpusEncoder = opus.NewEncoder(
 			int(currentCaptureConfig.Codec.ClockRate), // Should be 48000
 			opusEncoderChannels,                       // Use actual source channels for encoder
-			opus.AppVoIP,
+			app,
 		)
 		if errOpusEncoder != nil {
 			log.Fatalf("Failed to create Opus encoder: %v", errOpusEncoder)
 		}
-		log.Printf("Opus encoder initialized: SR=%d, Input CH=%d, App=VoIP",
+
+		var appString string
+		switch app {
+		case opus.AppVoIP:
+			appString = "VoIP"
+		case opus.AppAudio:
+			appString = "Audio"
+		case opus.AppRestrictedLowdelay:
+			appString = "Restricted Low Delay"
+		}
+
+		log.Printf("Opus encoder initialized: SR=%d, Input CH=%d, App=%s",
 			currentCaptureConfig.Codec.ClockRate,
-			opusEncoderChannels)
+			opusEncoderChannels,
+			appString)
 
 		if appConfig.OpusMaxAverageBitrate > 0 {
 			if err := opusEncoder.SetBitrate(appConfig.OpusMaxAverageBitrate); err != nil {
