@@ -5,6 +5,7 @@ import (
 	"log"
 	"time"
 	"unsafe" // Required for CoTaskMemFree
+
 	"github.com/go-ole/go-ole"
 	"github.com/moutend/go-wca/pkg/wca"
 	"github.com/pion/webrtc/v4" // Updated to v4
@@ -22,8 +23,8 @@ type AudioCaptureConfig struct {
 	Channels        uint16
 	BitDepth        uint16 // e.g., 16 for int16, 32 for float32
 	IsFloat         bool
-	FramesPerBuffer uint32 // Number of frames in each buffer from WASAPI
-	NBlockAlign     uint16 // Store NBlockAlign to avoid race condition with CoTaskMemFree
+	FramesPerBuffer uint32                    // Number of frames in each buffer from WASAPI
+	NBlockAlign     uint16                    // Store NBlockAlign to avoid race condition with CoTaskMemFree
 	Codec           webrtc.RTPCodecCapability // For informing WebRTC track creation
 }
 
@@ -110,10 +111,10 @@ func StartAudioCapture() (readOnlyAudioChan <-chan []byte, config *AudioCaptureC
 	}
 
 	captureConfig := &AudioCaptureConfig{
-		SampleRate: waveFormat.NSamplesPerSec,
-		Channels:   waveFormat.NChannels,
-		BitDepth:   waveFormat.WBitsPerSample,
-		IsFloat:    isFloat,
+		SampleRate:  waveFormat.NSamplesPerSec,
+		Channels:    waveFormat.NChannels,
+		BitDepth:    waveFormat.WBitsPerSample,
+		IsFloat:     isFloat,
 		NBlockAlign: waveFormat.NBlockAlign, // Store NBlockAlign here
 		// Codec will be set in main.go after this function returns
 	}
@@ -177,71 +178,104 @@ func StartAudioCapture() (readOnlyAudioChan <-chan []byte, config *AudioCaptureC
 		}
 		log.Printf("Capture goroutine polling every %v", sleepDuration)
 
-		for {
+		for { // Outer loop
 			time.Sleep(sleepDuration)
 
 			var numFramesInNextPacket uint32
-			err := captureClient.GetNextPacketSize(&numFramesInNextPacket)
+			err := captureClient.GetNextPacketSize(&numFramesInNextPacket) // Initial check for packets
 			if err != nil {
-				log.Printf("GetNextPacketSize failed: %v. Stopping capture.", err)
+				log.Printf("GetNextPacketSize failed in outer loop: %v. Stopping capture.", err)
 				return
 			}
 
-			if numFramesInNextPacket == 0 {
-				continue
-			}
+			for numFramesInNextPacket > 0 { // Inner loop: process all available packets
+				var pData *byte
+				var numFramesAvailable uint32 // GetBuffer will set this
+				var flags uint32
+				var devicePosition, qpcPosition uint64
 
-			var pData *byte
-			var numFramesAvailable uint32 = numFramesInNextPacket // This can be updated by GetBuffer
-			var flags uint32
-			var devicePosition, qpcPosition uint64 // Not used but required by API
-
-			err = captureClient.GetBuffer(&pData, &numFramesAvailable, &flags, &devicePosition, &qpcPosition)
-			if err != nil {
-				log.Printf("IAudioCaptureClient.GetBuffer failed: %v. Stopping capture.", err)
-				return
-			}
-			
-			var audioData []byte
-			if pData != nil && numFramesAvailable > 0 {
-				// Calculate buffer size in bytes: numFramesAvailable * NBlockAlign
-				// Use captureConfig.NBlockAlign which was safely copied.
-				if captureConfig.NBlockAlign == 0 {
-					log.Printf("captureConfig.NBlockAlign is 0. Skipping buffer processing.")
-					captureClient.ReleaseBuffer(numFramesAvailable) // Release buffer even if not processed
-					continue
+				err = captureClient.GetBuffer(&pData, &numFramesAvailable, &flags, &devicePosition, &qpcPosition)
+				if err != nil {
+					log.Printf("IAudioCaptureClient.GetBuffer failed: %v. Stopping capture.", err)
+					return
 				}
-				bufferSizeInBytes := numFramesAvailable * uint32(captureConfig.NBlockAlign)
-				audioData = unsafe.Slice(pData, int(bufferSizeInBytes))
-			} else {
-				// No data or pData is nil, but ReleaseBuffer still needs to be called
-				captureClient.ReleaseBuffer(numFramesAvailable)
-				continue
-			}
 
+				if numFramesAvailable == 0 {
+					// If no frames were actually made available by GetBuffer (e.g. a status flag was set instead of data)
+					// Release 0 frames and check for the next packet.
+					captureClient.ReleaseBuffer(0)
+					err = captureClient.GetNextPacketSize(&numFramesInNextPacket) // Check for next packet
+					if err != nil {
+						log.Printf("GetNextPacketSize failed in inner loop (after 0 frames from GetBuffer): %v. Stopping capture.", err)
+						return
+					}
+					continue // Continue inner loop to re-evaluate numFramesInNextPacket
+				}
 
-			// Process data (e.g., convert if necessary, then send)
-			if flags&wca.AUDCLNT_BUFFERFLAGS_SILENT != 0 {
-				// log.Println("Silent packet received")
-				// For silent packets, audioData might contain silence or be marked by flag.
-				// If sending zeros, ensure it's the correct length.
-			}
+				var audioData []byte
+				// Handle AUDCLNT_BUFFERFLAGS_SILENT: pData might be NULL.
+				// If silent, we should generate silence. Otherwise, use pData.
+				if flags&wca.AUDCLNT_BUFFERFLAGS_SILENT != 0 {
+					// log.Printf("Silent packet received, numFramesAvailable: %d", numFramesAvailable)
+					if captureConfig.NBlockAlign == 0 {
+						log.Printf("captureConfig.NBlockAlign is 0 for silent packet. Cannot determine size. Stopping capture.")
+						captureClient.ReleaseBuffer(numFramesAvailable) // Release the "silent" frames
+						return                                          // Critical error
+					}
+					bufferSizeInBytes := numFramesAvailable * uint32(captureConfig.NBlockAlign)
+					audioData = make([]byte, bufferSizeInBytes) // Creates a zeroed slice
+				} else if pData != nil {
+					// Regular data packet
+					if captureConfig.NBlockAlign == 0 {
+						log.Printf("captureConfig.NBlockAlign is 0. Skipping buffer processing.")
+						captureClient.ReleaseBuffer(numFramesAvailable)
+						err = captureClient.GetNextPacketSize(&numFramesInNextPacket) // Check for next packet
+						if err != nil {
+							log.Printf("GetNextPacketSize failed in inner loop (NBlockAlign 0): %v. Stopping capture.", err)
+							return
+						}
+						continue // Continue inner loop
+					}
+					bufferSizeInBytes := numFramesAvailable * uint32(captureConfig.NBlockAlign)
+					audioData = unsafe.Slice(pData, int(bufferSizeInBytes))
+				} else {
+					// pData is nil, not silent, and numFramesAvailable > 0. This is an unexpected state.
+					log.Printf("pData is nil, not AUDCLNT_BUFFERFLAGS_SILENT, numFramesAvailable: %d. Skipping packet.", numFramesAvailable)
+					captureClient.ReleaseBuffer(numFramesAvailable)
+					err = captureClient.GetNextPacketSize(&numFramesInNextPacket) // Check for next packet
+					if err != nil {
+						log.Printf("GetNextPacketSize failed after unexpected nil pData: %v. Stopping capture.", err)
+						return
+					}
+					continue // Continue inner loop
+				}
 
-			chunkToSend := make([]byte, len(audioData))
-			copy(chunkToSend, audioData)
+				// Create a copy to send on the channel, as audioData's underlying buffer will be released.
+				chunkToSend := make([]byte, len(audioData))
+				copy(chunkToSend, audioData)
 
-			err = captureClient.ReleaseBuffer(numFramesAvailable) // framesRead for ReleaseBuffer
-			if err != nil {
-				log.Printf("ReleaseBuffer failed: %v. Stopping capture.", err)
-				return
-			}
+				err = captureClient.ReleaseBuffer(numFramesAvailable)
+				if err != nil {
+					log.Printf("ReleaseBuffer failed: %v. Stopping capture.", err)
+					return
+				}
 
-			select {
-			case audioChan <- chunkToSend:
-			default:
-				log.Println("Audio channel full, discarding packet.")
-			}
-		}
+				// After processing and releasing, send the data
+				select {
+				case audioChan <- chunkToSend:
+				default:
+					log.Println("Audio channel full, discarding packet.")
+				}
+
+				// Check if there's another packet immediately available for the inner loop
+				err = captureClient.GetNextPacketSize(&numFramesInNextPacket)
+				if err != nil {
+					log.Printf("GetNextPacketSize failed in inner loop (end): %v. Stopping capture.", err)
+					return
+				}
+				// The inner loop condition (numFramesInNextPacket > 0) will be re-evaluated.
+			} // End of inner loop
+		} // End of outer loop
 	}()
 
 	return audioChan, captureConfig, nil
