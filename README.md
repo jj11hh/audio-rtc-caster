@@ -11,10 +11,11 @@ This project demonstrates a WebRTC audio streaming setup where a Python server c
 │   ├── index.html          # Main HTML page for the client
 │   └── js/
 │       └── main.js         # Client-side JavaScript for WebRTC connection, audio playback, and meters
-└── server/
-    ├── server.py           # Python server using aiohttp and aiortc for WebRTC signaling and streaming
-    ├── audio_tracks.py     # Python classes for audio tracks (input from buffer, sine wave)
-    └── audio_capture_manager.py # Handles audio capture
+├── server-go/              # Server implemented in Go
+│   └── main.go           # Main Go server application
+└── server/                 # Server implemented in Python
+    └── server.py         # Main Python server application
+
 ```
 
 ## Features
@@ -32,6 +33,18 @@ This project demonstrates a WebRTC audio streaming setup where a Python server c
         -   Sets audio bitrate (`b=AS:` line) in the SDP.
     -   Serves the HTML/JS client.
     -   Logs to `app.log` and console.
+
+-   **Go WebRTC Server (`server-go/main.go`)**:
+    -   Uses Go's standard `net/http` package for the web server (signaling and serving client files).
+    -   Uses `pion/webrtc/v4` for WebRTC peer connection and media handling.
+    -   **Audio Input Management**:
+        -   Captures audio from the system's default input device using WASAPI on Windows (via `go-ole` and custom WASAPI bindings - not shown in `main.go` but inferred from `CoInitialize` and typical usage).
+    -   **Alternative Sine Wave Source**: Option to stream a generated 440Hz sine wave for testing (`--sine-wave` argument).
+    -   **SDP Customization / Codec Handling**:
+        -   Determines codec capabilities based on command-line arguments to prefer specific codecs (Opus, PCMU, PCMA, G722).
+        -   Allows fine-tuning of Opus parameters (e.g., `opus-maxaveragebitrate`, `opus-maxplaybackrate`, `opus-cbr`, `opus-useinbandfec`, `opus-usedtx`).
+    -   Serves the HTML/JS client (attempts to serve from `./client` then `../client`).
+    -   Logs to the console.
 
 -   **Web Client (`client/js/main.js`, `client/index.html`)**:
     -   Connects to the Python server via WebRTC.
@@ -79,10 +92,42 @@ This project demonstrates a WebRTC audio streaming setup where a Python server c
 2.  **Open the Client in a Web Browser:**
     Open the URL provided by the server in a WebRTC-compatible browser (e.g., Chrome, Firefox). This is typically `http://localhost:8088`. The client attempts to connect automatically on load.
 
-3.  **Audio Playback:**
+2.  **Start the Go Server (Alternative to Python Server):**
+    Navigate to the `server-go/` directory:
+    ```bash
+    cd server-go
+    go run main.go [OPTIONS]
+    ```
+    Or build it first:
+    ```bash
+    go build -o webrtc_audio_server main.go
+    ./webrtc_audio_server [OPTIONS]
+    ```
+
+    **Command-line arguments for `main.go`:**
+    *   `--sine-wave`: Stream a 440Hz sine wave instead of system audio. Default: `false`.
+    *   `--preferred-codec <CODEC>`: Preferred audio codec. Choices: `opus`, `pcmu`, `pcma`, `g722`. Default: `opus`.
+    *   `--audio-bitrate <BPS>`: Target audio bitrate in bps for Opus encoder if `opus-maxaveragebitrate` is not set. Default: `96000`.
+    *   `--opus-maxaveragebitrate <BPS>`: Opus specific: Sets 'maxaveragebitrate' in bps. Overrides `--audio-bitrate` for Opus. `0` means not set. Default: `0`.
+    *   `--opus-maxplaybackrate <HZ>`: Opus specific: Sets 'maxplaybackrate' (e.g., 8000, 12000, 16000, 24000, 48000). Default: `48000`.
+    *   `--opus-cbr`: Opus specific: Enable constant bitrate. Default: `false`.
+    *   `--opus-useinbandfec`: Opus specific: Enable inband Forward Error Correction. Default: `true`.
+    *   `--opus-usedtx`: Opus specific: Enable Discontinuous Transmission. Default: `true`.
+    *   `--port <PORT>`: Port for the HTTP server. Default: `8088`.
+
+    The server will log its status and the URL to access the client (usually `http://localhost:8088` or `http://<your-hostname>:8088`).
+
+3.  **Open the Client in a Web Browser (after starting one of the servers):**
+    Open the URL provided by the server in a WebRTC-compatible browser (e.g., Chrome, Firefox). This is typically `http://localhost:8088`. The client attempts to connect automatically on load.
+
+4.  **Audio Playback:**
     Once connected, audio from the server should start playing, and the loudness meters will activate. The "Start" button changes state to reflect the connection and playback status.
 
 ## How It Works
+
+## How It Works (General, focusing on Python server example)
+
+*The Go server ([`server-go/main.go`](server-go/main.go:1)) follows a similar WebRTC flow but uses Go's `net/http` for serving and `pion/webrtc` for media handling.*
 
 1.  The Python server ([`server/server.py`](server/server.py:1)) starts an `aiohttp` web server.
 2.  It serves the client files ([`client/index.html`](client/index.html:1) and [`client/js/main.js`](client/js/main.js:1)).
@@ -109,9 +154,10 @@ This project demonstrates a WebRTC audio streaming setup where a Python server c
 
 ## Key Files
 
--   **[`server/server.py`](server/server.py:1)**: Main server logic, WebRTC signaling, CLI argument parsing, SDP answer modification.
--   **[`server/audio_tracks.py`](server/audio_tracks.py:1)**: Defines `AudioInputTrack` (consumes from ring buffer) and `SineWaveTrack`.
--   **`server/audio_capture_manager.py`** (Content not provided but inferred): Responsible for audio device enumeration, selection (possibly TUI), and capturing audio into a `NumpyRingBuffer` for `AudioInputTrack`.
+-   **[`server/server.py`](server/server.py:1)**: Main Python server logic, WebRTC signaling, CLI argument parsing, SDP answer modification.
+-   **[`server-go/main.go`](server-go/main.go:1)**: Main Go server logic, WebRTC signaling, CLI argument parsing, audio capture (WASAPI or sine wave), and media handling with Pion WebRTC.
+-   **[`server/audio_tracks.py`](server/audio_tracks.py:1)**: (Python server) Defines `AudioInputTrack` (consumes from ring buffer) and `SineWaveTrack`.
+-   **`server/audio_capture_manager.py`** (Content not provided but inferred for Python server): Responsible for audio device enumeration, selection (possibly TUI), and capturing audio into a `NumpyRingBuffer` for `AudioInputTrack`.
 -   **[`client/index.html`](client/index.html:1)**: HTML structure for the client, including the audio player and SVG meters.
 -   **[`client/js/main.js`](client/js/main.js:1)**: Client-side WebRTC logic, SDP offer modification, audio playback, and loudness meter updates.
 -   **[`requirements.txt`](requirements.txt:1)**: Python package dependencies.
@@ -125,3 +171,42 @@ This project demonstrates a WebRTC audio streaming setup where a Python server c
 -   More detailed error reporting on the client for specific WebRTC/Audio issues.
 -   Add unit and integration tests for both server and client components.
 -   Explore different audio processing options on the client or server.
+
+## Creating a Release Package
+
+A Python script ([`create_release_package.py`](create_release_package.py:1)) is provided to simplify the process of packaging the Go server and the client application for distribution. This is particularly useful because the Go server can be compiled into a standalone executable, removing the need for a Go environment on the target machine, unlike the Python server which requires a Python environment and dependencies.
+
+### Prerequisites
+
+-   Python 3.x installed and in your PATH.
+-   Go programming language installed and in your PATH (for compiling the Go server).
+-   Git installed and in your PATH (for versioning the package name).
+-   The project should be a Git repository to allow the script to determine the branch/tag and commit hash.
+
+### How to Use
+
+1.  Navigate to the root directory of the project in your terminal.
+2.  Run the script:
+    ```bash
+    python create_release_package.py
+    ```
+
+### What the Script Does
+
+1.  **Determines Platform:** Identifies the operating system (e.g., `windows`, `linux`, `darwin`).
+2.  **Fetches Git Information:**
+    -   Tries to get the current Git tag. If no tag is on the current commit, it uses the current branch name.
+    -   Gets the short commit hash of the current HEAD.
+3.  **Builds Go Server:**
+    -   The build command is executed from the project's root directory.
+    -   It compiles the Go server package located at `./server-go` (which includes [`main.go`](server-go/main.go:1)).
+    -   The output executable will be named `server-go.exe` on Windows, and `server-go` on other platforms (e.g., Linux, macOS). The executable is placed inside the `server-go/` directory (e.g., `server-go/server-go.exe`).
+4.  **Creates Zip Package:**
+    -   A zip file is created in the project root directory.
+    -   The naming convention for the zip file is: `rtc-caster-[platform]-[tag_or_branch]-[commit_hash].zip`
+        -   Example: `rtc-caster-windows-main-a1b2c3d.zip` or `rtc-caster-linux-v1.0.0-e4f5g6h.zip`
+    -   **Contents of the zip file:**
+        -   The compiled Go server executable (e.g., `server-go.exe` or `server-go`) at the root of the archive.
+        -   The entire `client/` folder and its contents, maintaining its structure (e.g., [`client/index.html`](client/index.html:1), [`client/js/main.js`](client/js/main.js:1)).
+
+After running the script, you will find the zip package in the project's root directory, ready for distribution.
