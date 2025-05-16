@@ -13,6 +13,8 @@ github.com/jj11hh/opus v0.0.0-20250515112757-0d5fb4c89a5e h1:JFfCC6JgYmKKSSeOjs4
 github.com/jj11hh/opus v0.0.0-20250515112757-0d5fb4c89a5e/go.mod h1:yrBZZK5nFX98BOI+jBthuWqHHYiLMZwX9mTaPXX7cdg=
 github.com/jj11hh/opus v0.0.0-20250515125752-b873e4f49824 h1:vsehGDMQFgpfWxE1W6RNEsrZFLrEbuBpglbjrqmahQ8=
 github.com/jj11hh/opus v0.0.0-20250515125752-b873e4f49824/go.mod h1:yrBZZK5nFX98BOI+jBthuWqHHYiLMZwX9mTaPXX7cdg=
+github.com/jj11hh/opus v1.0.1 h1:4R0m7r7U4g2QwFoeiDhRJOQ0Qt9+AP2lDQLwqRVXaww=
+github.com/jj11hh/opus v1.0.1/go.mod h1:yrBZZK5nFX98BOI+jBthuWqHHYiLMZwX9mTaPXX7cdg=
 github.com/kr/pretty v0.1.0/go.mod h1:dAy3ld7l9f0ibDNOQOHHMYYIIbhfbHSm3C4ZsoJORNo=
 github.com/kr/pty v1.1.1/go.mod h1:pFQYn66WHrOpPYNljwOMqo10TkYh1fy3cYio2l3bCsQ=
 github.com/kr/text v0.1.0/go.mod h1:4Jbv+DJW3UT/LiOwJeYQe1efqtUx/iVham/4vfdArNI=

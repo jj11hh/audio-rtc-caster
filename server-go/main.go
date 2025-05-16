@@ -619,7 +619,17 @@ func main() {
 		},
 	}
 
-	clientDirPath := "../client"
+	clientDirPath := "./client"
+
+	if _, err := os.Stat(clientDirPath); err != nil {
+		log.Printf("Failed to stat client directory %s, use ../client instead: %v", clientDirPath, err)
+		clientDirPath = "../client"
+	}
+
+	if _, err := os.Stat(clientDirPath); err != nil {
+		log.Printf("Failed to stat client directory %s: %v", clientDirPath, err)
+	}
+
 	fs := http.FileServer(http.Dir(clientDirPath))
 	http.Handle("/", fs)
 	log.Printf("Serving static files from %s at /", clientDirPath)

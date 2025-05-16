@@ -10,7 +10,7 @@ require (
 )
 
 require (
-	github.com/jj11hh/opus v0.0.0-20250515125752-b873e4f49824 // direct
+	github.com/jj11hh/opus v1.0.1 // direct
 	github.com/pion/datachannel v1.5.10 // indirect
 	github.com/pion/dtls/v3 v3.0.6 // indirect
 	github.com/pion/ice/v4 v4.0.10 // indirect
